@@ -1,6 +1,6 @@
-// VERSION: 2.0.8.0
+// VERSION: 2.0.8.2
 // 🟢 面板核心配置区 (放在最顶端方便修改)
-const CURRENT_VERSION = "2.0.8.0";
+const CURRENT_VERSION = "2.0.8.2";
 const GITHUB_RAW_URL = "https://raw.githubusercontent.com/azxcvjj/cf-media-proxy/main/cf-media-proxy.js";
 
 // ==========================================
@@ -4442,6 +4442,7 @@ export default {
         let targetUrls = []; let currentMode = 'off'; let enableCache = true; let remainingPath = '';
         const decodedPath = decodeURIComponent(url.pathname); let matchedPrefix = null;
         let proxyOrigin = new URL(request.url).origin;
+        let isPassthroughMode = false; // 标记是否为 URL 透传模式，透传模式下不重写响应中的媒体 URL
 
         // ==========================================
         // 🔒 UHD 海报墙修复函数
@@ -4672,6 +4673,29 @@ export default {
                 if (value && !candidates.includes(value)) candidates.push(value);
             };
 
+            // 🚨 紧急修复：检测并修复损坏的 URL 路径
+            // 当 remainingPath 形如 /embyhttps://... 或 /embyhttp://... 时，
+            // 说明之前的 URL 拼接出了问题，client/server 的 bug 导致 protocol 被拼接到了 path 中
+            // 正确做法是从中提取真正的 URL 并返回
+            if (remainingPath && remainingPath.includes('://')) {
+                const afterSlash = remainingPath.substring(1); // 去掉开头的 /
+                // 检查是否包含类似 "embyhttps://" 或 "embyhttp://" 的损坏模式
+                const damagedMatch = afterSlash.match(/^([a-z]+)(https?:\/\/)(.+)/i);
+                if (damagedMatch) {
+                    const protocol = damagedMatch[2]; // https:// 或 http://
+                    const restUrl = damagedMatch[3]; // 域名+路径
+                    const fixedUrl = protocol + restUrl;
+                    try {
+                        const parsed = new URL(fixedUrl);
+                        pushUnique(fixedUrl);
+                        // 也尝试不带域名中可能错误拼接的 emby 前缀
+                        const cleanUrl = parsed.origin + parsed.pathname + parsed.search + parsed.hash;
+                        if (cleanUrl !== fixedUrl) pushUnique(cleanUrl);
+                    } catch (e) { /* 解析失败 */ }
+                    return candidates;
+                }
+            }
+
             const primary = targetBase + remainingPath + search;
             pushUnique(primary);
 
@@ -4806,7 +4830,34 @@ export default {
 
             // HUD 最容易踩坑的是这里：返回 /emby/videos/... 时，必须显式补上线路前缀。
             // 否则客户端会去请求站点根路径 /emby/...，直接绕开当前 /{prefix} 代理节点。
-            if (trimmedValue.startsWith('/')) return toWorkerPlaybackPath(trimmedValue, '', '', safePrefix);
+            // 区分处理：
+            // - /emby/... 路径（如OK）：前后端不分离，返回相对路径，让客户端自己拼接
+            // - /videos/... 等路径（如UHD）：前后端分离，返回源站完整地址
+            if (trimmedValue.startsWith('/')) {
+                // 检查路径是否是媒体文件路径（/videos/... 或 /Audio/...）
+                if (trimmedValue.match(/^\/(videos|Audio)\//)) {
+                    // UHD：前后端分离，返回源站完整地址
+                    return `${targetUrl.origin}${trimmedValue}`;
+                }
+                // OK 或其他：前后端不分离，返回相对路径
+                return toWorkerPlaybackPath(trimmedValue, '', '', safePrefix);
+            }
+
+            // 处理不带斜杠前缀的路径，可能是损坏的绝对 URL（如 embxhttps://...）
+            // 尝试检测并修复这种情况
+            if (/^[a-z]+\https?:\/\//i.test(trimmedValue)) {
+                // 匹配 embxhttps://... 或类似的损坏 URL
+                const fixed = trimmedValue.replace(/^([a-z]+)(\https?:\/\/)/i, '$1/$2');
+                try {
+                    const parsed = new URL(fixed);
+                    if (Array.isArray(targetOrigins) && !targetOrigins.includes(parsed.origin)) {
+                        return `${proxyOrigin}${safePrefix}/${parsed.href}`;
+                    }
+                    return toWorkerPlaybackPath(parsed.pathname, parsed.search, parsed.hash, safePrefix);
+                } catch (e) {
+                    // 如果修复后还是解析失败，尝试直接用原始值
+                }
+            }
 
             // 少数实现会返回不带前导斜杠的相对路径，例如 videos/123/master.m3u8。
             // 这时先按源站地址解析成绝对 URL，再映射回 Worker 代理地址，保证路径语义不变。
@@ -4902,8 +4953,26 @@ export default {
                 matchedPrefix = prefix; remainingPath = '/' + pathParts.slice(2).join('/');
                 remainingPath = normalizeRemainingPathForPlayback(remainingPath, matchedPrefix);
                 targetUrls = route.target.split(',').map(s => s.trim()).filter(Boolean);
-                
-                if (remainingPath.startsWith('/http://') || remainingPath.startsWith('/https://')) { targetUrls = [remainingPath.substring(1)]; remainingPath = ''; }
+
+                // 🚨 紧急修复：当 remainingPath 包含损坏的 URL 模式（如 /embyhttps://）时
+                // 直接将其转换为正确的 targetUrl，绕过后续的 buildUpstreamCandidates
+                if (remainingPath.includes('://')) {
+                    const pathWithoutSlash = remainingPath.substring(1);
+                    const damagedMatch = pathWithoutSlash.match(/^([a-z]+)(https?:\/\/)(.+)/i);
+                    if (damagedMatch) {
+                        const protocol = damagedMatch[2];
+                        const restUrl = damagedMatch[3];
+                        const fixedUrl = protocol + restUrl;
+                        try {
+                            new URL(fixedUrl);
+                            targetUrls = [fixedUrl];
+                            remainingPath = '';
+                            // 不 return，让代码继续正常流程
+                        } catch (e) {}
+                    }
+                }
+
+                if (remainingPath.startsWith('/http://') || remainingPath.startsWith('/https://')) { targetUrls = [remainingPath.substring(1)]; remainingPath = ''; isPassthroughMode = true; }
             } catch (e) { return new Response("DB Error: " + e.message, { status: 500 }); }
         }
 
@@ -5043,7 +5112,8 @@ export default {
         // ==========================================
 
         // 🔒 PlaybackInfo 完整修复：支持所有地址格式 + 字幕流 DeliveryUrl
-        if (finalResponse.status === 200 && responseHeaders.get("content-type")?.includes("json") && url.pathname.toLowerCase().includes("playbackinfo")) {
+        // ⚠️ 透传模式下跳过响应重写，因为客户端期望收到源站真实 URL
+        if (!isPassthroughMode && finalResponse.status === 200 && responseHeaders.get("content-type")?.includes("json") && url.pathname.toLowerCase().includes("playbackinfo")) {
             try {
                 let clonedRes = finalResponse.clone();
                 let data = await clonedRes.json();
@@ -5087,8 +5157,9 @@ export default {
         // 🔒 UHD 海报墙修复：通用 JSON URL 重写
         // PlaybackInfo 只覆盖播放地址；UHD 图片失败通常发生在其他 JSON 接口里，
         // 例如详情页、图片列表或插件接口返回了源站绝对地址/相对图片路径。
+        // ⚠️ 透传模式下跳过响应重写
         // ==========================================
-        if (finalResponse.status === 200 && responseHeaders.get("content-type")?.includes("json")) {
+        if (!isPassthroughMode && finalResponse.status === 200 && responseHeaders.get("content-type")?.includes("json")) {
             try {
                 let clonedRes = finalResponse.clone();
                 let text = await clonedRes.text();
