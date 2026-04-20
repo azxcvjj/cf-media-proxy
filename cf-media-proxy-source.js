@@ -1,6 +1,6 @@
-// VERSION: 2.0.8.3
+// VERSION: 2.0.8.4
 // 🟢 面板核心配置区 (放在最顶端方便修改)
-const CURRENT_VERSION = "2.0.8.3";
+const CURRENT_VERSION = "2.0.8.4";
 const GITHUB_RAW_URL = "https://raw.githubusercontent.com/azxcvjj/cf-media-proxy/main/cf-media-proxy.js";
 
 // ==========================================
@@ -3371,16 +3371,31 @@ async function sendTgNodeStatus(env, chatId, messageId = null) {
         });
 
         const msg =
-            `${getGreeting()}，节点状态如下\n` +
-            `━━━━━━━━━━━━━━━━━━\n\n` +
+            `<b>${getGreeting()}，节点状态如下</b>\n` +
+            `━━━━━━━━━━━━━━━━\n\n` +
             `╭ 📊 节点列表 (${routes.results.length}) ╮\n` +
             lines.join('\n') + '\n' +
             `╰─────────────╯\n\n` +
-            `━━━━━━━━━━━━━━━━━━\n` +
+            `━━━━━━━━━━━━━━━━\n` +
             `⏱️ ${fmtTime(now)}`;
 
         const keyboard = [[{ text: '🔙 返回统计', callback_data: 'back_to_stats' }]];
-        await sendTgMessage(env, chatId, msg, messageId, keyboard);
+
+        if (messageId) {
+            await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/editMessageCaption`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    chat_id: chatId,
+                    message_id: messageId,
+                    caption: msg,
+                    parse_mode: 'HTML',
+                    reply_markup: JSON.stringify({ inline_keyboard: keyboard })
+                })
+            });
+        } else {
+            await sendTgMessage(env, chatId, msg, null, keyboard);
+        }
     } catch (e) {
         console.error('TG NodeStatus Error:', e);
     }
@@ -3444,7 +3459,7 @@ async function sendTgVisitorDetail(env, chatId, messageId = null) {
 
         const msg =
             `${getGreeting()}，访客详情如下\n` +
-            `━━━━━━━━━━━━━━━━━━\n\n` +
+            `━━━━━━━━━━━━━━━━\n\n` +
             `╭ 📈 访问概况 ╮\n` +
             `│ 今日访问     ${today} 次\n` +
             `│ 7天访问     ${week} 次\n` +
@@ -3456,11 +3471,26 @@ async function sendTgVisitorDetail(env, chatId, messageId = null) {
             `╭ 🚀 Top 访问节点 ╮\n` +
             pathLines + '\n' +
             `╰─────────────╯\n\n` +
-            `━━━━━━━━━━━━━━━━━━\n` +
+            `━━━━━━━━━━━━━━━━\n` +
             `⏱️ ${fmtTime(now)}`;
 
         const keyboard = [[{ text: '🔙 返回统计', callback_data: 'back_to_stats' }]];
-        await sendTgMessage(env, chatId, msg, messageId, keyboard);
+
+        if (messageId) {
+            await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/editMessageCaption`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    chat_id: chatId,
+                    message_id: messageId,
+                    caption: msg,
+                    parse_mode: 'HTML',
+                    reply_markup: JSON.stringify({ inline_keyboard: keyboard })
+                })
+            });
+        } else {
+            await sendTgMessage(env, chatId, msg, null, keyboard);
+        }
     } catch (e) {
         console.error('TG VisitorDetail Error:', e);
     }
@@ -3498,71 +3528,114 @@ async function sendTgStats(env, chatId, messageId = null) {
         // 解析客户端软件名称（只显示客户端名，不显示平台和版本）
         const parseClientName = (ua) => {
             if (!ua || ua === 'Unknown') return null;
-            
-            // 转为小写并清理版本号
-            let cleanUA = ua.toLowerCase();
-            
-            // 清理常见的版本号格式: Chrome/120.0, Firefox/121.0, Safari/17.0 等
-            cleanUA = cleanUA.replace(/\/(?:[\d.]+|\d+)/g, '');
-            // 清理括号内的版本信息: (Windows NT 10.0; Win64; x64) 或 (compatible; ...)
-            cleanUA = cleanUA.replace(/\([^)]*\)/g, ' ');
-            // 清理额外的空格
-            cleanUA = cleanUA.replace(/\s+/g, ' ').trim();
-            
-            // Emby 相关客户端（优先匹配）
+
+            const lowerUA = ua.toLowerCase();
+
+            // 检测操作系统
+            const detectOS = () => {
+                if (lowerUA.includes('windows phone')) return 'Windows Phone';
+                if (lowerUA.includes('iphone') || lowerUA.includes('ipad') || lowerUA.includes('ios')) return 'iOS';
+                if (lowerUA.includes('android')) return 'Android';
+                if (lowerUA.includes('mac os') || lowerUA.includes('macintosh')) return 'macOS';
+                if (lowerUA.includes('windows')) return 'Windows';
+                if (lowerUA.includes('ubuntu')) return 'Ubuntu';
+                if (lowerUA.includes('linux')) return 'Linux';
+                return null;
+            };
+
+            const os = detectOS();
+
+            // 清理版本号和括号信息用于软件匹配
+            let cleanUA = lowerUA
+                .replace(/\/(?:[\d.]+|\d+)/g, '')  // 清理版本号
+                .replace(/\([^)]*\)/g, ' ')          // 清理括号
+                .replace(/\s+/g, ' ').trim();
+
+            // ========== iOS/iPadOS 客户端 ==========
+            if (cleanUA.includes('infuse')) return 'Infuse iOS';
+            if (cleanUA.includes('yybx')) return 'yybx iOS';
+            if (cleanUA.includes('iemc')) return 'iemc iOS';
+            if (cleanUA.includes('fileball')) return 'Fileball iOS';
+            if (cleanUA.includes('hamhub')) return 'HamHub iOS';
+            if (cleanUA.includes('senplayer')) return 'SenPlayer iOS';
+            if (cleanUA.includes('conflux')) return 'Conflux iOS';
+            if (cleanUA.includes('iplay')) return os ? `iPlay ${os}` : 'iPlay';
+            if (cleanUA.includes('forward')) return 'Forward iOS';
+            if (cleanUA.includes('reflix')) return 'Reflix iOS';
+            if (cleanUA.includes('capyplayer')) return 'CapyPlayer iOS';
+
+            // ========== Android 客户端 ==========
+            if (cleanUA.includes('afusekt')) return 'Afusekt Android';
+            if (cleanUA.includes('yamby')) return 'Yamby Android';
+            if (cleanUA.includes('findroid')) return 'Findroid Android';
+            if (cleanUA.includes('femor')) return 'Femor Android';
+
+            // ========== Windows 客户端 ==========
+            if (cleanUA.includes('tsukimi')) return 'Tsukimi Windows';
+
+            // ========== 跨平台客户端 ==========
+            if (/\bhills\b/i.test(cleanUA)) return os ? `Hills ${os}` : 'Hills';
+
+            // Emby 相关客户端
             if (cleanUA.includes('emby') || cleanUA.includes('emby-theater') || cleanUA.includes('emby-web')) {
-                return 'Emby';
+                return os ? `Emby ${os}` : 'Emby';
             }
 
             // Jellyfin 相关客户端
             if (cleanUA.includes('jellyfin') || cleanUA.includes('jellyfin-web')) {
-                return 'Jellyfin';
+                return os ? `Jellyfin ${os}` : 'Jellyfin';
             }
-
-            // Infuse
-            if (cleanUA.includes('infuse')) {
-                return 'Infuse';
-            }
-
-            // Kodi
-            if (cleanUA.includes('kodi')) return 'Kodi';
 
             // Plex
             if (cleanUA.includes('plex') || cleanUA.includes('plexamp') || cleanUA.includes('plexmp')) {
-                return 'Plex';
+                return os ? `Plex ${os}` : 'Plex';
             }
 
-            // 常见浏览器（需要匹配清理后的UA）
-            if (cleanUA.includes('chrome') && !cleanUA.includes('edg')) return 'Chrome';
-            if (cleanUA.includes('firefox')) return 'Firefox';
-            if (cleanUA.includes('safari') && !cleanUA.includes('chrome')) return 'Safari';
-            if (cleanUA.includes('edge') || cleanUA.includes('edg')) return 'Edge';
-            if (cleanUA.includes('opera') || cleanUA.includes('opr')) return 'Opera';
-            if (cleanUA.includes('brave')) return 'Brave';
+            // Kodi
+            if (cleanUA.includes('kodi')) {
+                return os ? `Kodi ${os}` : 'Kodi';
+            }
 
-            // 常见移动应用
-            if (cleanUA.includes('android')) return 'Android';
-            if (cleanUA.includes('iphone') || cleanUA.includes('ipad') || cleanUA.includes('ios')) return 'iOS';
-            if (cleanUA.includes('windows phone')) return 'Windows Phone';
+            // ========== 浏览器 ==========
+            if (cleanUA.includes('chrome') && !cleanUA.includes('edg')) {
+                return os ? `Chrome ${os}` : 'Chrome';
+            }
+            if (cleanUA.includes('firefox')) {
+                return os ? `Firefox ${os}` : 'Firefox';
+            }
+            if (cleanUA.includes('safari') && !cleanUA.includes('chrome')) {
+                return os ? `Safari ${os}` : 'Safari';
+            }
+            if (cleanUA.includes('edge') || cleanUA.includes('edg')) {
+                return os ? `Edge ${os}` : 'Edge';
+            }
+            if (cleanUA.includes('opera') || cleanUA.includes('opr')) {
+                return os ? `Opera ${os}` : 'Opera';
+            }
+            if (cleanUA.includes('brave')) {
+                return os ? `Brave ${os}` : 'Brave';
+            }
 
-            // 常见操作系统
-            if (cleanUA.includes('windows')) return 'Windows';
-            if (cleanUA.includes('mac os') || cleanUA.includes('macintosh')) return 'macOS';
-            if (cleanUA.includes('linux')) return 'Linux';
-            if (cleanUA.includes('ubuntu')) return 'Ubuntu';
-
-            // 常见媒体播放器
-            if (cleanUA.includes('vlc')) return 'VLC';
-            if (cleanUA.includes('mpv')) return 'MPV';
-            if (cleanUA.includes('mplayer')) return 'MPlayer';
-
-            // Forward 系列（Emby 客户端）
-            if (cleanUA.includes('forward')) return 'Forward';
+            // ========== 媒体播放器 ==========
+            if (cleanUA.includes('vlc')) {
+                return os ? `VLC ${os}` : 'VLC';
+            }
+            if (cleanUA.includes('mpv')) {
+                return os ? `MPV ${os}` : 'MPV';
+            }
+            if (cleanUA.includes('mplayer')) {
+                return os ? `MPlayer ${os}` : 'MPlayer';
+            }
 
             // 常见下载工具
-            if (cleanUA.includes('curl') || cleanUA.includes('wget')) return '命令行工具';
+            if (cleanUA.includes('curl') || cleanUA.includes('wget')) {
+                return '命令行工具';
+            }
 
-            // 未知但有数据（使用清理后的UA，最多显示50字符）
+            // 常见操作系统（放最后兜底）
+            if (os) return os;
+
+            // 未知但有数据
             if (cleanUA.length > 0 && cleanUA.length < 80) {
                 return cleanUA.substring(0, 50);
             }
@@ -3570,19 +3643,25 @@ async function sendTgStats(env, chatId, messageId = null) {
             return '其他';
         };
 
-        // 根据客户端名称获取图标
+        // 根据客户端名称获取图标（按操作系统平台）
         const getClientIcon = (name) => {
-            const mediaServers = ['Emby', 'Jellyfin', 'Plex', 'Infuse', 'Kodi', 'Forward'];
-            const browsers = ['Chrome', 'Firefox', 'Safari', 'Edge', 'Opera', 'Brave'];
-            const players = ['VLC', 'MPV', 'MPlayer', 'IINA'];
-            const mobile = ['Android', 'iOS', 'Windows Phone'];
-            const cmdTools = ['命令行工具'];
+            // 从名称中提取操作系统
+            const osMatch = name.match(/(iOS|Android|Windows|macOS|Linux|Ubuntu|Windows Phone)/);
+            const os = osMatch ? osMatch[1] : name;
 
-            if (mediaServers.includes(name)) return '📺';
-            if (browsers.includes(name)) return '🌐';
-            if (players.includes(name)) return '🎬';
-            if (mobile.includes(name)) return '📱';
-            if (cmdTools.includes(name)) return '⚙️';
+            // 苹果系统
+            if (os === 'iOS' || os === 'macOS') return '🍎';
+            // Android
+            if (os === 'Android') return '🤖';
+            // Windows
+            if (os === 'Windows') return '💻';
+            // Linux 系列
+            if (os === 'Linux' || os === 'Ubuntu') return '🐧';
+            // Windows Phone
+            if (os === 'Windows Phone') return '📱';
+            // 命令行工具
+            if (name === '命令行工具') return '⚙️';
+            // 其他默认手机图标
             return '📱';
         };
 
@@ -3723,8 +3802,8 @@ async function sendTgStats(env, chatId, messageId = null) {
         else if (hour >= 18) greeting = '🌙 晚上好';
 
         const msg =
-            `${greeting}，运行数据已更新\n` +
-            `━━━━━━━━━━━━━━━━━━\n\n` +
+            `<b>${greeting}，运行数据已更新</b>\n` +
+            `━━━━━━━━━━━━━━━━\n\n` +
             `╭ 📊 访问统计 ╮\n` +
             `│ 📺 今日播放     ${totalStr}\n` +
             `│ 🌍 热门地区     ${regionStr}\n` +
@@ -3743,28 +3822,43 @@ async function sendTgStats(env, chatId, messageId = null) {
             `╭ 🏆 流量之王 ╮\n` +
             `│ 👑 ${topNodeMsg}\n` +
             `╰─────────────╯\n\n` +
-            `━━━━━━━━━━━━━━━━━━\n` +
+            `━━━━━━━━━━━━━━━━\n` +
             `⏱️ ${fmtTime(now)} 更新`;
 
-        const apiUrl = messageId
-            ? `https://api.telegram.org/bot${env.TG_BOT_TOKEN}/editMessageText`
-            : `https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`;
+        // 随机壁纸 URL（添加时间戳防止缓存）
+        const TOP_IMAGE_URL = `https://t.mwm.moe/pc?t=${Date.now()}`;
 
-        const payload = messageId
-            ? { chat_id: chatId, message_id: messageId, text: msg, parse_mode: 'HTML',
-                reply_markup: JSON.stringify({ inline_keyboard: [
-                    [{ text: '🔄 刷新数据', callback_data: 'refresh_stats' }, { text: '📊 节点状态', callback_data: 'node_status' }]
-                ]})}
-            : { chat_id: chatId, text: msg, parse_mode: 'HTML',
-                reply_markup: JSON.stringify({ inline_keyboard: [
-                    [{ text: '🔄 刷新数据', callback_data: 'refresh_stats' }, { text: '📊 节点状态', callback_data: 'node_status' }]
-                ]})};
+        const replyMarkup = JSON.stringify({ inline_keyboard: [
+            [{ text: '🔄 刷新数据', callback_data: 'refresh_stats' }, { text: '📊 节点状态', callback_data: 'node_status' }]
+        ]});
 
-        await fetch(apiUrl, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload)
-        });
+        if (messageId) {
+            // 有 messageId 时用 editMessageCaption（编辑带图片消息的 caption）
+            await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/editMessageCaption`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    chat_id: chatId,
+                    message_id: messageId,
+                    caption: msg,
+                    parse_mode: 'HTML',
+                    reply_markup: replyMarkup
+                })
+            });
+        } else {
+            // 首次发送，用 sendPhoto 带随机壁纸
+            await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendPhoto`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    chat_id: chatId,
+                    photo: TOP_IMAGE_URL,
+                    caption: msg,
+                    parse_mode: 'HTML',
+                    reply_markup: replyMarkup
+                })
+            });
+        }
     } catch (e) {
         console.error("TG Send Error:", e);
     }
@@ -4832,12 +4926,12 @@ export default {
             // 否则客户端会去请求站点根路径 /emby/...，直接绕开当前 /{prefix} 代理节点。
             // 区分处理：
             // - /emby/... 路径（如OK）：前后端不分离，返回相对路径，让客户端自己拼接
-            // - /videos/... 等路径（如UHD）：前后端分离，返回源站完整地址
+            // - /videos/... 等路径（如UHD）：前后端分离，但仍然走 Worker 代理
             if (trimmedValue.startsWith('/')) {
                 // 检查路径是否是媒体文件路径（/videos/... 或 /Audio/...）
                 if (trimmedValue.match(/^\/(videos|Audio)\//)) {
-                    // UHD：前后端分离，返回源站完整地址
-                    return `${targetUrl.origin}${trimmedValue}`;
+                    // UHD：前后端分离，但仍然走 Worker 代理，不直接暴露源站地址
+                    return `${proxyOrigin}${safePrefix}/${targetUrl.origin}${trimmedValue}`;
                 }
                 // OK 或其他：前后端不分离，返回相对路径
                 return toWorkerPlaybackPath(trimmedValue, '', '', safePrefix);
