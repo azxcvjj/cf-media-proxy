@@ -1,6 +1,8 @@
 # cf-media-proxy
 
 基于 Cloudflare Workers 的媒体库反向代理管理平台，支持多节点负载均衡、访客统计分析、Telegram Bot 通知。
+原作者MakkaPakka | Telegram: https://t.me/MakkaPakkaOvO
+本项目主要进行日常同步问题修复，前端及tg通知优化。
 
 ## 功能特性
 
@@ -34,7 +36,3 @@
 ### v2.0.8.2
 - 修复同源/跨域 URL 处理逻辑，同时支持 Hills Windows (OK服务器) 和 Forward iOS (UHD服务器) 播放
 - 混淆版添加版本注释，修复在线更新检测功能
-
-## 作者
-
-MakkaPakka | Telegram: https://t.me/MakkaPakkaOvO
