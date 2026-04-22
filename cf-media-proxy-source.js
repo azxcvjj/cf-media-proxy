@@ -1,6 +1,6 @@
-// VERSION: 2.0.8.4
+// VERSION: 2.0.8.5
 // 🟢 面板核心配置区 (放在最顶端方便修改)
-const CURRENT_VERSION = "2.0.8.4";
+const CURRENT_VERSION = "2.0.8.5";
 const GITHUB_RAW_URL = "https://raw.githubusercontent.com/azxcvjj/cf-media-proxy/main/cf-media-proxy.js";
 
 // ==========================================
@@ -4072,6 +4072,15 @@ export default {
         if (url.pathname === '/api/tg-webhook' && request.method === 'POST') {
             try {
                 const body = await request.json();
+                const senderChatId = body.message?.chat?.id || body.callback_query?.message?.chat?.id;
+                const isAuthorizedChat = env.TG_CHAT_ID && String(senderChatId) === String(env.TG_CHAT_ID);
+
+                // 未授权的 Chat ID 直接忽略
+                if (!isAuthorizedChat) {
+                    console.log(`Unauthorized TG access attempt from chatId: ${senderChatId}`);
+                    return new Response("OK");
+                }
+
                 // 处理命令
                 if (body.message && body.message.text === '/stats') {
                     if (env.DB && env.TG_BOT_TOKEN) {
