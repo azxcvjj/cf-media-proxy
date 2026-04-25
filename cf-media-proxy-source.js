@@ -1,6 +1,6 @@
-// VERSION: 2.0.8.5
+﻿// VERSION: 2.1.0.2
 // 🟢 面板核心配置区 (放在最顶端方便修改)
-const CURRENT_VERSION = "2.0.8.5";
+const CURRENT_VERSION = "2.1.0.2";
 const GITHUB_RAW_URL = "https://raw.githubusercontent.com/azxcvjj/cf-media-proxy/main/cf-media-proxy.js";
 
 // ==========================================
@@ -9,6 +9,23 @@ const GITHUB_RAW_URL = "https://raw.githubusercontent.com/azxcvjj/cf-media-proxy
 // 设置为 true = 允许通用反代 (格式: /http://xxx 或 /https://xxx)
 // 设置为 false = 禁止通用反代 (只能通过已配置的节点访问)
 const ALLOW_GENERAL_PROXY = true;
+
+// ==========================================
+// 🟢 通用反代 URL 格式配置
+// ==========================================
+// 支持两种通用反代 URL 格式：
+// 1. 传统格式: /https://example.com/path (直接拼接)
+// 2. 编码格式: /https/example.com/443/path (Go项目风格，更规范)
+// 设置为 true = 优先使用编码格式 /{scheme}/{domain}/{port}/{path}
+// 设置为 false = 仅使用传统格式 /{scheme}://{full-url}
+const ENABLE_ENCODED_PROXY_FORMAT = true;
+
+// ==========================================
+// 🟢 日志分级配置
+// ==========================================
+// 设置为 true = 启用详细日志分级 [API]/[STREAM]/[PROXY]
+// 设置为 false = 仅保留基本错误日志
+const ENABLE_DETAILED_LOGGING = false;
 
 // ==========================================
 // 🟢 数据库查询优化配置
@@ -23,6 +40,87 @@ function fmtTime(ts) {
     const ms = typeof ts === 'number' ? ts : ts.getTime();
     const d = new Date(ms + 8 * 3600000);
     return `${d.getUTCMonth() + 1}月${d.getUTCDate()}日 ${d.getUTCHours().toString().padStart(2,'0')}:${d.getUTCMinutes().toString().padStart(2,'0')}`;
+}
+
+// 统一字节格式化函数
+function formatBytes(bytes) {
+    if (bytes >= 1099511627776) return (bytes / 1099511627776).toFixed(2) + " TB";
+    if (bytes >= 1073741824) return (bytes / 1073741824).toFixed(2) + " GB";
+    if (bytes >= 1048576) return (bytes / 1048576).toFixed(2) + " MB";
+    if (bytes >= 1024) return (bytes / 1024).toFixed(2) + " KB";
+    if (bytes > 0) return bytes + " B";
+    return "0 B";
+}
+
+// 统一客户端名称解析函数
+function parseClientName(ua) {
+    if (!ua || ua === 'Unknown') return null;
+    const lowerUA = ua.toLowerCase();
+    const detectOS = () => {
+        if (lowerUA.includes('windows phone')) return 'Windows Phone';
+        if (lowerUA.includes('iphone') || lowerUA.includes('ipad') || lowerUA.includes('ios')) return 'iOS';
+        if (lowerUA.includes('android')) return 'Android';
+        if (lowerUA.includes('mac os') || lowerUA.includes('macintosh')) return 'macOS';
+        if (lowerUA.includes('windows')) return 'Windows';
+        if (lowerUA.includes('ubuntu')) return 'Ubuntu';
+        if (lowerUA.includes('linux')) return 'Linux';
+        return null;
+    };
+    const os = detectOS();
+    let cleanUA = lowerUA.replace(/\/(?:[\d.]+|\d+)/g, '').replace(/\([^)]*\)/g, ' ').replace(/\s+/g, ' ').trim();
+    // iOS 客户端
+    if (cleanUA.includes('infuse')) return 'Infuse iOS';
+    if (cleanUA.includes('yybx')) return 'yybx iOS';
+    if (cleanUA.includes('iemc')) return 'iemc iOS';
+    if (cleanUA.includes('fileball')) return 'Fileball iOS';
+    if (cleanUA.includes('hamhub')) return 'HamHub iOS';
+    if (cleanUA.includes('senplayer')) return 'SenPlayer iOS';
+    if (cleanUA.includes('conflux')) return 'Conflux iOS';
+    if (cleanUA.includes('iplay')) return os ? `iPlay ${os}` : 'iPlay';
+    if (cleanUA.includes('forward')) return 'Forward iOS';
+    if (cleanUA.includes('reflix')) return 'Reflix iOS';
+    if (cleanUA.includes('capyplayer')) return 'CapyPlayer iOS';
+    // Android 客户端
+    if (cleanUA.includes('afusekt')) return 'Afusekt Android';
+    if (cleanUA.includes('yamby')) return 'Yamby Android';
+    if (cleanUA.includes('findroid')) return 'Findroid Android';
+    if (cleanUA.includes('femor')) return 'Femor Android';
+    // Windows 客户端
+    if (cleanUA.includes('tsukimi')) return 'Tsukimi Windows';
+    // 跨平台客户端
+    if (/\bhills\b/i.test(cleanUA)) return os ? `Hills ${os}` : 'Hills';
+    if (cleanUA.includes('emby')) return os ? `Emby ${os}` : 'Emby';
+    if (cleanUA.includes('jellyfin')) return os ? `Jellyfin ${os}` : 'Jellyfin';
+    if (cleanUA.includes('plex')) return os ? `Plex ${os}` : 'Plex';
+    if (cleanUA.includes('kodi')) return os ? `Kodi ${os}` : 'Kodi';
+    // 浏览器
+    if (cleanUA.includes('chrome') && !cleanUA.includes('edg')) return os ? `Chrome ${os}` : 'Chrome';
+    if (cleanUA.includes('firefox')) return os ? `Firefox ${os}` : 'Firefox';
+    if (cleanUA.includes('safari') && !cleanUA.includes('chrome')) return os ? `Safari ${os}` : 'Safari';
+    if (cleanUA.includes('edge') || cleanUA.includes('edg')) return os ? `Edge ${os}` : 'Edge';
+    if (cleanUA.includes('opera') || cleanUA.includes('opr')) return os ? `Opera ${os}` : 'Opera';
+    if (cleanUA.includes('brave')) return os ? `Brave ${os}` : 'Brave';
+    // 播放器
+    if (cleanUA.includes('vlc')) return os ? `VLC ${os}` : 'VLC';
+    if (cleanUA.includes('mpv')) return os ? `MPV ${os}` : 'MPV';
+    if (cleanUA.includes('mplayer')) return os ? `MPlayer ${os}` : 'MPlayer';
+    if (cleanUA.includes('curl') || cleanUA.includes('wget')) return '命令行工具';
+    if (os) return os;
+    if (cleanUA.length > 0 && cleanUA.length < 80) return cleanUA.substring(0, 50);
+    return '其他';
+}
+
+// 统一客户端图标获取函数
+function getClientIcon(name) {
+    const osMatch = name.match(/(iOS|Android|Windows|macOS|Linux|Ubuntu|Windows Phone)/);
+    const os = osMatch ? osMatch[1] : name;
+    if (os === 'iOS' || os === 'macOS') return '🍎';
+    if (os === 'Android') return '🤖';
+    if (os === 'Windows') return '💻';
+    if (os === 'Linux' || os === 'Ubuntu') return '🐧';
+    if (os === 'Windows Phone') return '📱';
+    if (name === '命令行工具') return '⚙️';
+    return '📱';
 }
 // ==========================================
 
@@ -106,6 +204,69 @@ function logError(context, error, details = {}) {
     };
     console.error(`[${timestamp}] [${context}] Error:`, errorInfo);
     return errorInfo;
+}
+
+// ==========================================
+// 🟢 Cloudflare GraphQL 流量查询工具函数
+// ==========================================
+// 通用函数：按前缀分批查询流量，避免复杂度限制
+// 返回 Map<prefix, bytes>
+async function queryTrafficByPrefixes(env, routes, startISO, endISO, batchSize = 10) {
+    const bytesMap = new Map(routes.map(r => [r.prefix, 0]));
+    
+    // 分批查询避免 GraphQL 复杂度限制
+    const batches = [];
+    for (let i = 0; i < routes.length; i += batchSize) {
+        batches.push(routes.slice(i, i + batchSize));
+    }
+
+    for (const batch of batches) {
+        const prefixLike = batch.map(r => `{clientRequestPath_like:"/${r.prefix}%"}`).join(',');
+        const graphqlQuery = {
+            query: `query {
+              viewer {
+                zones(filter: {zoneTag: "${env.CF_ZONE_ID}"}) {
+                  httpRequestsAdaptiveGroups(
+                    limit: 5000,
+                    filter: {
+                      OR: [${prefixLike}],
+                      datetime_geq: "${startISO}",
+                      datetime_leq: "${endISO}"
+                    }
+                  ) {
+                    dimensions { clientRequestPath }
+                    sum { edgeResponseBytes }
+                  }
+                }
+              }
+            }`
+        };
+
+        try {
+            const cfRes = await fetch('https://api.cloudflare.com/client/v4/graphql', {
+                method: 'POST',
+                headers: { 'Authorization': `Bearer ${env.CF_API_TOKEN}`, 'Content-Type': 'application/json' },
+                body: JSON.stringify(graphqlQuery)
+            });
+
+            const cfData = await cfRes.json();
+            const groups = cfData?.data?.viewer?.zones?.[0]?.httpRequestsAdaptiveGroups || [];
+
+            groups.forEach(g => {
+                const path = g.dimensions?.clientRequestPath || '';
+                const bytes = g.sum?.edgeResponseBytes || 0;
+                routes.forEach(r => {
+                    if (path.startsWith('/' + r.prefix)) {
+                        bytesMap.set(r.prefix, (bytesMap.get(r.prefix) || 0) + bytes);
+                    }
+                });
+            });
+        } catch(e) {
+            console.error('GraphQL query failed:', e.message);
+        }
+    }
+
+    return bytesMap;
 }
 
 // ==========================================
@@ -3151,8 +3312,8 @@ const HTML_UI = `
                 if (!res.ok) return;
                 latestCode = await res.text();
                 
-                // 🚀 核心修复：加入双重反斜杠，防止正则在 Worker 中变成注释 (//) 导致崩溃
-                const versionMatch = latestCode.match(/\\/\\/\\s*VERSION:\\s*v?([\\d\\.]+)/i);
+                // 🚀 修复版本检测：匹配 CURRENT_VERSION = "x.x.x" 格式
+                const versionMatch = latestCode.match(/CURRENT_VERSION\s*=\s*["']?([\d.]+)/);
                 if (versionMatch && versionMatch[1]) {
                     const latestVersion = versionMatch[1];
                     if (latestVersion !== CURRENT_VERSION) {
@@ -3207,17 +3368,7 @@ const HTML_UI = `
 // 2. 后端 Worker 主逻辑处理区 (核心故障转移 + TG Bot播报 + 智能流量拉取)
 // ==========================================
 
-// 用于向 Cloudflare 获取对应时间段的总流量 (支持北京时间今日、近7天、近30天)
-// 智能流量格式化：去掉尾随零
-function formatBytes(bytes) {
-    if (bytes === 0) return "0 B";
-    if (bytes >= 1099511627776) return parseFloat((bytes / 1099511627776).toFixed(2)).toString() + " TB";
-    if (bytes >= 1073741824) return parseFloat((bytes / 1073741824).toFixed(2)).toString() + " GB";
-    if (bytes >= 1048576) return parseFloat((bytes / 1048576).toFixed(2)).toString() + " MB";
-    if (bytes >= 1024) return parseFloat((bytes / 1024).toFixed(2)).toString() + " KB";
-    return bytes + " B";
-}
-
+// getCFTraffic 使用顶部工具区的 formatBytes 函数
 async function getCFTraffic(env, type) {
     if (!env.CF_API_TOKEN || !env.CF_ZONE_ID) return "缺少变量";
     try {
@@ -3342,6 +3493,14 @@ async function sendTgMessage(env, chatId, text, messageId = null, extraKeyboard 
     }
 }
 
+// TG 消息问候语工具函数
+function getGreeting(now = Date.now()) {
+    const h = new Date(now + 8 * 3600000).getHours();
+    if (h < 12) return '☀️ 早上好';
+    if (h < 18) return '☕ 下午好';
+    return '🌙 晚上好';
+}
+
 // 节点状态播报
 async function sendTgNodeStatus(env, chatId, messageId = null) {
     try {
@@ -3351,18 +3510,12 @@ async function sendTgNodeStatus(env, chatId, messageId = null) {
         }
 
         const routes = await env.DB.prepare(`SELECT prefix, remark, target, mode, last_play FROM routes ORDER BY sort_order ASC, prefix ASC`).all();
-        if (!routes || routes.results.length === 0) {
+        if (!routes?.results?.length) {
             await sendTgMessage(env, chatId, '📭 暂无配置节点');
             return;
         }
 
         const now = Date.now();
-        const getGreeting = () => {
-            const h = new Date(now + 8 * 3600000).getHours();
-            if (h < 12) return '☀️ 早上好';
-            if (h < 18) return '☕ 下午好';
-            return '🌙 晚上好';
-        };
 
         const lines = routes.results.map(r => {
             const name = r.remark || r.prefix;
@@ -3424,38 +3577,27 @@ async function sendTgVisitorDetail(env, chatId, messageId = null) {
             `).all()
         ]);
 
-        const today = todayQuery?.c || 0;
-        const week = weekQuery?.c || 0;
+        const today = todayQuery?.c ?? 0;
+        const week = weekQuery?.c ?? 0;
         const avgDaily = Math.round(week / 7);
 
-        // Top UA
-        let uaLines = '│ 暂无记录';
-        if (topUasQuery && topUasQuery.results && topUasQuery.results.length > 0) {
-            uaLines = topUasQuery.results.map((r, i) => {
+        // Top UA - 使用可选链简化判断
+        const uaLines = topUasQuery?.results?.length > 0
+            ? topUasQuery.results.map((r, i) => {
                 const icon = r.ua?.toLowerCase().includes('emby') ? '📺' :
                              r.ua?.toLowerCase().includes('jellyfin') ? '🎬' :
                              r.ua?.toLowerCase().includes('chrome') ? '🌐' : '📱';
                 const name = r.ua?.length > 30 ? r.ua.substring(0, 30) + '...' : r.ua;
                 return `│ ${i + 1}. ${icon} ${name}   ${r.c}次`;
-            }).join('\n');
-        }
+            }).join('\n')
+            : '│ 暂无记录';
 
-        // Top paths
-        let pathLines = '│ 暂无记录';
-        if (topPathsQuery && topPathsQuery.results && topPathsQuery.results.length > 0) {
-            pathLines = topPathsQuery.results.map((r, i) => {
-                const name = r.remark || r.prefix;
-                return `│ ${i + 1}. ${name}   ${r.c}次`;
-            }).join('\n');
-        }
+        // Top paths - 使用可选链简化判断
+        const pathLines = topPathsQuery?.results?.length > 0
+            ? topPathsQuery.results.map((r, i) => `│ ${i + 1}. ${r.remark || r.prefix}   ${r.c}次`).join('\n')
+            : '│ 暂无记录';
 
         const now = Date.now();
-        const getGreeting = () => {
-            const h = new Date(now + 8 * 3600000).getHours();
-            if (h < 12) return '☀️ 早上好';
-            if (h < 18) return '☕ 下午好';
-            return '🌙 晚上好';
-        };
 
         const msg =
             `${getGreeting()}，访客详情如下\n` +
@@ -3525,175 +3667,24 @@ async function sendTgStats(env, chatId, messageId = null) {
             `).all()
         ]);
         
-        // 解析客户端软件名称（只显示客户端名，不显示平台和版本）
-        const parseClientName = (ua) => {
-            if (!ua || ua === 'Unknown') return null;
-
-            const lowerUA = ua.toLowerCase();
-
-            // 检测操作系统
-            const detectOS = () => {
-                if (lowerUA.includes('windows phone')) return 'Windows Phone';
-                if (lowerUA.includes('iphone') || lowerUA.includes('ipad') || lowerUA.includes('ios')) return 'iOS';
-                if (lowerUA.includes('android')) return 'Android';
-                if (lowerUA.includes('mac os') || lowerUA.includes('macintosh')) return 'macOS';
-                if (lowerUA.includes('windows')) return 'Windows';
-                if (lowerUA.includes('ubuntu')) return 'Ubuntu';
-                if (lowerUA.includes('linux')) return 'Linux';
-                return null;
-            };
-
-            const os = detectOS();
-
-            // 清理版本号和括号信息用于软件匹配
-            let cleanUA = lowerUA
-                .replace(/\/(?:[\d.]+|\d+)/g, '')  // 清理版本号
-                .replace(/\([^)]*\)/g, ' ')          // 清理括号
-                .replace(/\s+/g, ' ').trim();
-
-            // ========== iOS/iPadOS 客户端 ==========
-            if (cleanUA.includes('infuse')) return 'Infuse iOS';
-            if (cleanUA.includes('yybx')) return 'yybx iOS';
-            if (cleanUA.includes('iemc')) return 'iemc iOS';
-            if (cleanUA.includes('fileball')) return 'Fileball iOS';
-            if (cleanUA.includes('hamhub')) return 'HamHub iOS';
-            if (cleanUA.includes('senplayer')) return 'SenPlayer iOS';
-            if (cleanUA.includes('conflux')) return 'Conflux iOS';
-            if (cleanUA.includes('iplay')) return os ? `iPlay ${os}` : 'iPlay';
-            if (cleanUA.includes('forward')) return 'Forward iOS';
-            if (cleanUA.includes('reflix')) return 'Reflix iOS';
-            if (cleanUA.includes('capyplayer')) return 'CapyPlayer iOS';
-
-            // ========== Android 客户端 ==========
-            if (cleanUA.includes('afusekt')) return 'Afusekt Android';
-            if (cleanUA.includes('yamby')) return 'Yamby Android';
-            if (cleanUA.includes('findroid')) return 'Findroid Android';
-            if (cleanUA.includes('femor')) return 'Femor Android';
-
-            // ========== Windows 客户端 ==========
-            if (cleanUA.includes('tsukimi')) return 'Tsukimi Windows';
-
-            // ========== 跨平台客户端 ==========
-            if (/\bhills\b/i.test(cleanUA)) return os ? `Hills ${os}` : 'Hills';
-
-            // Emby 相关客户端
-            if (cleanUA.includes('emby') || cleanUA.includes('emby-theater') || cleanUA.includes('emby-web')) {
-                return os ? `Emby ${os}` : 'Emby';
-            }
-
-            // Jellyfin 相关客户端
-            if (cleanUA.includes('jellyfin') || cleanUA.includes('jellyfin-web')) {
-                return os ? `Jellyfin ${os}` : 'Jellyfin';
-            }
-
-            // Plex
-            if (cleanUA.includes('plex') || cleanUA.includes('plexamp') || cleanUA.includes('plexmp')) {
-                return os ? `Plex ${os}` : 'Plex';
-            }
-
-            // Kodi
-            if (cleanUA.includes('kodi')) {
-                return os ? `Kodi ${os}` : 'Kodi';
-            }
-
-            // ========== 浏览器 ==========
-            if (cleanUA.includes('chrome') && !cleanUA.includes('edg')) {
-                return os ? `Chrome ${os}` : 'Chrome';
-            }
-            if (cleanUA.includes('firefox')) {
-                return os ? `Firefox ${os}` : 'Firefox';
-            }
-            if (cleanUA.includes('safari') && !cleanUA.includes('chrome')) {
-                return os ? `Safari ${os}` : 'Safari';
-            }
-            if (cleanUA.includes('edge') || cleanUA.includes('edg')) {
-                return os ? `Edge ${os}` : 'Edge';
-            }
-            if (cleanUA.includes('opera') || cleanUA.includes('opr')) {
-                return os ? `Opera ${os}` : 'Opera';
-            }
-            if (cleanUA.includes('brave')) {
-                return os ? `Brave ${os}` : 'Brave';
-            }
-
-            // ========== 媒体播放器 ==========
-            if (cleanUA.includes('vlc')) {
-                return os ? `VLC ${os}` : 'VLC';
-            }
-            if (cleanUA.includes('mpv')) {
-                return os ? `MPV ${os}` : 'MPV';
-            }
-            if (cleanUA.includes('mplayer')) {
-                return os ? `MPlayer ${os}` : 'MPlayer';
-            }
-
-            // 常见下载工具
-            if (cleanUA.includes('curl') || cleanUA.includes('wget')) {
-                return '命令行工具';
-            }
-
-            // 常见操作系统（放最后兜底）
-            if (os) return os;
-
-            // 未知但有数据
-            if (cleanUA.length > 0 && cleanUA.length < 80) {
-                return cleanUA.substring(0, 50);
-            }
-
-            return '其他';
-        };
-
-        // 根据客户端名称获取图标（按操作系统平台）
-        const getClientIcon = (name) => {
-            // 从名称中提取操作系统
-            const osMatch = name.match(/(iOS|Android|Windows|macOS|Linux|Ubuntu|Windows Phone)/);
-            const os = osMatch ? osMatch[1] : name;
-
-            // 苹果系统
-            if (os === 'iOS' || os === 'macOS') return '🍎';
-            // Android
-            if (os === 'Android') return '🤖';
-            // Windows
-            if (os === 'Windows') return '💻';
-            // Linux 系列
-            if (os === 'Linux' || os === 'Ubuntu') return '🐧';
-            // Windows Phone
-            if (os === 'Windows Phone') return '📱';
-            // 命令行工具
-            if (name === '命令行工具') return '⚙️';
-            // 其他默认手机图标
-            return '📱';
-        };
-
         // 构建客户端统计消息（按观看次数排序）
         let clientStr = "暂无记录";
-        if (topClientQuery && topClientQuery.results && topClientQuery.results.length > 0) {
-            // 使用 Map 来合并相同客户端名的统计
+        if (topClientQuery?.results?.length > 0) {
+            // 使用 Map 合并相同客户端名的统计，使用 Map.get() 的默认值简化逻辑
             const clientMap = new Map();
-
             topClientQuery.results.forEach(row => {
                 const clientName = parseClientName(row.ua);
-                if (clientName) {
-                    if (clientMap.has(clientName)) {
-                        clientMap.set(clientName, clientMap.get(clientName) + row.c);
-                    } else {
-                        clientMap.set(clientName, row.c);
-                    }
-                }
+                if (clientName) clientMap.set(clientName, (clientMap.get(clientName) || 0) + row.c);
             });
             
-            // 按观看次数降序排序
-            const sortedClients = Array.from(clientMap.entries())
+            // 排序后最多显示5个，直接构建字符串
+            clientStr = Array.from(clientMap.entries())
                 .sort((a, b) => b[1] - a[1])
-                .slice(0, 5); // 最多显示5个
-
-            if (sortedClients.length > 0) {
-                clientStr = sortedClients.map(([name, count], index) => {
-                    const rankEmoji = ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣'][index];
-                    const icon = getClientIcon(name);
-                    return `│ ${rankEmoji} ${icon} ${name}   ${count}次`;
+                .slice(0, 5)
+                .map(([name, count], i) => {
+                    const rankEmoji = ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣'][i];
+                    return `│ ${rankEmoji} ${getClientIcon(name)} ${name}   ${count}次`;
                 }).join('\n');
-            }
         }
         
         // 获取多时间维度流量
@@ -3713,50 +3704,19 @@ async function sendTgStats(env, chatId, messageId = null) {
                     const beijingTime = new Date(end.getTime() + 8 * 3600000);
                     beijingTime.setUTCHours(0, 0, 0, 0);
                     const start = new Date(beijingTime.getTime() - 8 * 3600000);
+                    const endISO = end.toISOString();
+                    const startISO = start.toISOString();
 
-                    let maxBytes = 0;
-                    let topNodeName = "无";
-
-                    // 构造 OR 条件
-                    const prefixLike = routes.map(r => `{clientRequestPath_like:"/${r.prefix}%"}`).join(',');
-
-                    const graphqlQuery = {
-                        query: `query {
-                          viewer {
-                            zones(filter: {zoneTag: "${env.CF_ZONE_ID}"}) {
-                              httpRequestsAdaptiveGroups(
-                                limit: 5000,
-                                filter: {
-                                  OR: [${prefixLike}],
-                                  datetime_geq: "${start.toISOString()}",
-                                  datetime_leq: "${end.toISOString()}"
-                                }
-                              ) {
-                                dimensions { clientRequestPath }
-                                sum { edgeResponseBytes }
-                              }
-                            }
-                          }
-                        }`
-                    };
-
-                    const cfRes = await fetch('https://api.cloudflare.com/client/v4/graphql', {
-                        method: 'POST',
-                        headers: { 'Authorization': `Bearer ${env.CF_API_TOKEN}`, 'Content-Type': 'application/json' },
-                        body: JSON.stringify(graphqlQuery)
-                    });
-
-                    const cfData = await cfRes.json();
-                    const groups = cfData?.data?.viewer?.zones?.[0]?.httpRequestsAdaptiveGroups || [];
+                    const bytesByRoute = await queryTrafficByPrefixes(env, routes, startISO, endISO);
 
                     // 找出流量最大的节点
-                    groups.forEach(g => {
-                        const path = g.dimensions?.clientRequestPath || '';
-                        const bytes = g.sum?.edgeResponseBytes || 0;
-                        const matchedRoute = routes.find(r => path.startsWith('/' + r.prefix));
-                        if (matchedRoute && bytes > maxBytes) {
+                    let maxBytes = 0;
+                    let topNodeName = "无";
+                    bytesByRoute.forEach((bytes, prefix) => {
+                        if (bytes > maxBytes) {
                             maxBytes = bytes;
-                            topNodeName = matchedRoute.remark || matchedRoute.prefix;
+                            const matchedRoute = routes.find(r => r.prefix === prefix);
+                            topNodeName = matchedRoute?.remark || prefix;
                         }
                     });
 
@@ -3773,8 +3733,9 @@ async function sendTgStats(env, chatId, messageId = null) {
         }
         // ====================================================================
 
-        const todayCount = totalQuery ? totalQuery.count : 0;
-        const yesterdayCount = yesterdayQuery ? yesterdayQuery.count : 0;
+        // 使用可选链简化空值判断
+        const todayCount = totalQuery?.count ?? 0;
+        const yesterdayCount = yesterdayQuery?.count ?? 0;
         const trendStr = (() => {
             if (yesterdayCount === 0) return todayCount > 0 ? '📈 新高' : '➖ 暂无数据';
             const diff = todayCount - yesterdayCount;
@@ -3785,7 +3746,7 @@ async function sendTgStats(env, chatId, messageId = null) {
         })();
         const totalStr = `${todayCount}次 ${trendStr}`;
         const regionStr = topRegionQuery ? `${topRegionQuery.country === 'CN' ? '🇨🇳 中国大陆' : topRegionQuery.country} (${topRegionQuery.c}次)` : '暂无记录';
-        const nodeStr = (topNodeQuery && topNodeQuery.results && topNodeQuery.results.length > 0)
+        const nodeStr = topNodeQuery?.results?.length > 0
             ? topNodeQuery.results.map((r, i) => {
                 const rank = ['🥇', '🥈', '🥉'][i];
                 const name = r.remark || '未命名节点';
@@ -3794,12 +3755,7 @@ async function sendTgStats(env, chatId, messageId = null) {
             : '暂无记录';
 
         const now = new Date();
-        // 转换为 UTC+8 (北京时间)
-        const utc8 = new Date(now.getTime() + 8 * 3600000);
-        const hour = utc8.getHours();
-        let greeting = '☀️ 早上好';
-        if (hour >= 12 && hour < 18) greeting = '☕ 下午好';
-        else if (hour >= 18) greeting = '🌙 晚上好';
+        const greeting = getGreeting();
 
         const msg =
             `<b>${greeting}，运行数据已更新</b>\n` +
@@ -3865,10 +3821,22 @@ async function sendTgStats(env, chatId, messageId = null) {
 }
 
 export default {
-    // 每天自动运行发送 TG 统计
+    // 每天定时任务：发送 TG 统计 + 清理过期日志
     async scheduled(event, env, ctx) {
+        // 发送 TG 统计
         if (env.TG_BOT_TOKEN && env.TG_CHAT_ID && env.DB) {
             ctx.waitUntil(sendTgStats(env, env.TG_CHAT_ID));
+        }
+        // 每天清理一次过期日志（避免每次请求都执行 DELETE）
+        if (env.DB) {
+            ctx.waitUntil((async () => {
+                try {
+                    await env.DB.exec(`DELETE FROM visitor_logs WHERE timestamp < datetime('now', '-7 days')`);
+                    console.log('visitor_logs cleanup completed');
+                } catch(e) {
+                    console.error('visitor_logs cleanup failed:', e.message);
+                }
+            })());
         }
     },
 
@@ -4414,6 +4382,10 @@ export default {
             // 大数据记录核心表：访客日志
             await env.DB.exec(`CREATE TABLE IF NOT EXISTS visitor_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, prefix TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP, ip TEXT, country TEXT, ua TEXT)`);
             
+            // 添加索引提升查询性能
+            try { await env.DB.exec(`CREATE INDEX IF NOT EXISTS idx_visitor_logs_country ON visitor_logs(country)`); } catch(e) {}
+            try { await env.DB.exec(`CREATE INDEX IF NOT EXISTS idx_visitor_logs_timestamp ON visitor_logs(timestamp)`); } catch(e) {}
+            
             try { await env.DB.exec(`ALTER TABLE routes ADD COLUMN mode TEXT DEFAULT 'off'`); } catch(e) {}
             try { await env.DB.exec(`ALTER TABLE routes ADD COLUMN remark TEXT DEFAULT ''`); } catch(e) {}
             try { await env.DB.exec(`ALTER TABLE routes ADD COLUMN last_play TEXT DEFAULT ''`); } catch(e) {}
@@ -4421,8 +4393,7 @@ export default {
             try { await env.DB.exec(`ALTER TABLE routes ADD COLUMN cache_img TEXT DEFAULT 'on'`); } catch(e) {} 
             try { await env.DB.exec(`ALTER TABLE routes ADD COLUMN sort_order INTEGER DEFAULT 0`); } catch(e) {}
 
-            // 数据防爆清理策略：自动清理过去 7 天的精细日志
-            try { await env.DB.exec(`DELETE FROM visitor_logs WHERE timestamp < datetime('now', '-7 days')`); } catch(e) {}
+            // 数据防爆清理策略：已移至 scheduled 定时任务，每天执行一次
 
             // 🚀 【方案A修复版】：独立并发查流，完美绕过 CF 免费版复杂度限制！
             if (request.method === 'GET') {
@@ -4441,61 +4412,15 @@ export default {
                     const beijingTime = new Date(end.getTime() + 8 * 3600000);
                     beijingTime.setUTCHours(0, 0, 0, 0);
                     const start = new Date(beijingTime.getTime() - 8 * 3600000);
-
-                    // 构造 OR 条件
-                    const prefixLike = routes.map(r => `{clientRequestPath_like:"/${r.prefix}%"}`).join(',');
-
-                    const graphqlQuery = {
-                        query: `query {
-                          viewer {
-                            zones(filter: {zoneTag: "${env.CF_ZONE_ID}"}) {
-                              httpRequestsAdaptiveGroups(
-                                limit: 5000,
-                                filter: {
-                                  OR: [${prefixLike}],
-                                  datetime_geq: "${start.toISOString()}",
-                                  datetime_leq: "${end.toISOString()}"
-                                }
-                              ) {
-                                dimensions { clientRequestPath }
-                                sum { edgeResponseBytes }
-                              }
-                            }
-                          }
-                        }`
-                    };
+                    const endISO = end.toISOString();
+                    const startISO = start.toISOString();
 
                     try {
-                        const cfRes = await fetch('https://api.cloudflare.com/client/v4/graphql', {
-                            method: 'POST',
-                            headers: { 'Authorization': `Bearer ${env.CF_API_TOKEN}`, 'Content-Type': 'application/json' },
-                            body: JSON.stringify(graphqlQuery)
-                        });
-
-                        const cfData = await cfRes.json();
-                        const groups = cfData?.data?.viewer?.zones?.[0]?.httpRequestsAdaptiveGroups || [];
-
-                        const bytesMap = new Map(routes.map(r => [r.prefix, 0]));
-
-                        groups.forEach(g => {
-                            const path = g.dimensions?.clientRequestPath || '';
-                            const bytes = g.sum?.edgeResponseBytes || 0;
-                            routes.forEach(r => {
-                                if (path.startsWith('/' + r.prefix)) {
-                                    bytesMap.set(r.prefix, (bytesMap.get(r.prefix) || 0) + bytes);
-                                }
-                            });
-                        });
+                        const bytesMap = await queryTrafficByPrefixes(env, routes, startISO, endISO);
 
                         routes.forEach(r => {
                             const bytes = bytesMap.get(r.prefix) || 0;
-                            let formatted = "0 B";
-                            if (bytes >= 1099511627776) formatted = (bytes / 1099511627776).toFixed(2) + " TB";
-                            else if (bytes >= 1073741824) formatted = (bytes / 1073741824).toFixed(2) + " GB";
-                            else if (bytes >= 1048576) formatted = (bytes / 1048576).toFixed(2) + " MB";
-                            else if (bytes >= 1024) formatted = (bytes / 1024).toFixed(2) + " KB";
-                            else if (bytes > 0) formatted = bytes + " B";
-                            r.todayBandwidth = formatted;
+                            r.todayBandwidth = formatBytes(bytes);
                         });
                     } catch(e) {
                         routes.forEach(r => { r.todayBandwidth = "获取异常"; });
@@ -4650,6 +4575,21 @@ export default {
         // 递归处理 JSON 里的所有字符串字段。
         // UHD 图片地址不固定出现在某一个字段，可能藏在 ImageTags、BackdropImageTags、
         // Artwork、ProviderIds 或插件返回的嵌套对象里；只改顶层字段会漏掉一部分高清图。
+        // 
+        // ✅ 服务器地址字段也需要重写
+        // Forward 等客户端的"自动更新服务器地址"功能会使用返回的地址更新连接
+        // 如果返回源站地址，客户端会自动切换到源站，绕过代理
+        // 因此必须将服务器地址也重写为代理地址
+        const SERVER_ADDRESS_FIELDS = new Set([
+            'LocalAddress', 'RemoteAddress', 'ServerUrl', 'BaseUrl',
+            'serverUrl', 'baseUrl', 'localAddress', 'remoteAddress',
+            'address', 'Address'
+        ]);
+        
+        function isServerAddressField(key) {
+            return SERVER_ADDRESS_FIELDS.has(key);
+        }
+        
         function rewriteSourceUrlsInJson(value, targetOrigins, proxyOrigin, safePrefix) {
             if (typeof value === 'string') return rewriteSourceUrlString(value, targetOrigins, proxyOrigin, safePrefix);
             if (Array.isArray(value)) {
@@ -4665,6 +4605,11 @@ export default {
                 let changed = false;
                 const next = {};
                 for (const key of Object.keys(value)) {
+                    // 服务器地址字段也重写（支持 Forward 等客户端的自动更新功能）
+                    if (isServerAddressField(key)) {
+                        next[key] = rewriteSourceUrlString(value[key], targetOrigins, proxyOrigin, safePrefix);
+                        continue;
+                    }
                     const rewritten = rewriteSourceUrlsInJson(value[key], targetOrigins, proxyOrigin, safePrefix);
                     if (rewritten !== value[key]) changed = true;
                     next[key] = rewritten;
@@ -4894,31 +4839,7 @@ export default {
                 return trimmedValue.substring(proxyOrigin.length);
             }
 
-            // 对绝对地址分两类处理：
-            // 1. 同源绝对地址：保留源站原始 path，只在前面补 /{prefix}
-            // 2. 跨源绝对地址：保留成 Worker 的"绝对 URL 透传代理"形式
-            //
-            // HUD / FWD 一类自研服务有时会在 PlaybackInfo 中返回完整绝对媒体地址，
-            // 甚至媒体 host 与 API host 不同。这里如果只保留 pathname，会把真正的媒体源 host 丢掉，
-            // 最终表现为 PlaybackInfo 成功、实际拉流失败。
-            //
-            // 因此跨源绝对地址必须继续走：
-            // /{prefix}/https://real-media-host/...
-            //
-            // 这样 Worker 仍然能带着现有 header/回退逻辑去请求真实媒体地址，
-            // 同时也不会把 HUD 明确依赖的 /emby 子路径语义抹掉。
-            if (/^https?:\/\//i.test(trimmedValue)) {
-                try {
-                    const parsed = new URL(trimmedValue);
-                    if (Array.isArray(targetOrigins) && !targetOrigins.includes(parsed.origin)) {
-                        return `${proxyOrigin}${safePrefix}/${trimmedValue}`;
-                    }
-                    return toWorkerPlaybackPath(parsed.pathname, parsed.search, parsed.hash, safePrefix);
-                } catch (e) {
-                    return rawValue;
-                }
-            }
-
+            // 处理协议相对地址 //host/path
             if (trimmedValue.startsWith('//')) {
                 try {
                     const parsed = new URL(targetUrl.protocol + trimmedValue);
@@ -4931,15 +4852,40 @@ export default {
                 }
             }
 
+            // 🆕 统一处理绝对地址（包含媒体路径特殊处理）
+            // 修复 UHD 媒体服务器同源绝对地址被转换为相对路径导致前缀丢失的问题
+            // 当源站返回如 https://v1.uhdnow.com/videos/xxx.m3u8 这样的同源绝对地址时：
+            // - 之前逻辑：转换为 /uhd/videos/xxx.m3u8（相对路径）
+            // - 问题：某些客户端（如 Forward）可能不会正确处理相对路径，导致前缀丢失
+            // - 修复后：始终返回完整的代理 URL 格式 /uhd/https://v1.uhdnow.com/videos/xxx.m3u8
+            // 这样即使客户端不使用相对路径解析，也能确保请求经过 Worker 代理
+            if (/^https?:\/\//i.test(trimmedValue)) {
+                try {
+                    const parsed = new URL(trimmedValue);
+                    // 对于媒体文件路径（/videos/... 或 /Audio/...），始终返回完整的代理 URL 格式
+                    if (parsed.pathname.match(/^\/(videos|Audio)\//)) {
+                        return `${proxyOrigin}${safePrefix}/${trimmedValue}`;
+                    }
+                    // 其他跨源地址返回完整代理 URL
+                    if (Array.isArray(targetOrigins) && !targetOrigins.includes(parsed.origin)) {
+                        return `${proxyOrigin}${safePrefix}/${trimmedValue}`;
+                    }
+                    // 同源非媒体地址保持原有逻辑
+                    return toWorkerPlaybackPath(parsed.pathname, parsed.search, parsed.hash, safePrefix);
+                } catch (e) {
+                    return rawValue;
+                }
+            }
+
             // HUD 最容易踩坑的是这里：返回 /emby/videos/... 时，必须显式补上线路前缀。
             // 否则客户端会去请求站点根路径 /emby/...，直接绕开当前 /{prefix} 代理节点。
             // 区分处理：
             // - /emby/... 路径（如OK）：前后端不分离，返回相对路径，让客户端自己拼接
-            // - /videos/... 等路径（如UHD）：前后端分离，但仍然走 Worker 代理
+            // - /videos/... 等路径（如UHD）：前后端分离，必须返回完整的代理 URL
             if (trimmedValue.startsWith('/')) {
                 // 检查路径是否是媒体文件路径（/videos/... 或 /Audio/...）
                 if (trimmedValue.match(/^\/(videos|Audio)\//)) {
-                    // UHD：前后端分离，但仍然走 Worker 代理，不直接暴露源站地址
+                    // UHD：前后端分离，必须返回完整的代理 URL，不返回相对路径
                     return `${proxyOrigin}${safePrefix}/${targetUrl.origin}${trimmedValue}`;
                 }
                 // OK 或其他：前后端不分离，返回相对路径
@@ -4996,6 +4942,204 @@ export default {
             return location;
         }
 
+        // ==========================================
+        // 🆕 Go项目风格：编码格式 URL 解析
+        // 格式: /{scheme}/{domain}/{port}/{path}
+        // 例如: /https/emby.example.com/443/videos/123.m3u8
+        // ==========================================
+        function parseEncodedProxyUrl(path) {
+            // 匹配 /{scheme}/{domain}/{port}/{path} 格式
+            // scheme: http 或 https
+            // domain: 域名或IP（支持 IPv6）
+            // port: 端口号 1-65535
+            // path: 剩余路径
+            const match = path.match(/^\/(https?)\/([^\/]+)\/(\d+)\/(.*)$/i);
+            if (!match) return null;
+
+            const scheme = match[1].toLowerCase();
+            let domain = match[2];
+            const port = parseInt(match[3], 10);
+            let remainingPath = '/' + match[4];
+
+            // 验证 scheme
+            if (scheme !== 'http' && scheme !== 'https') return null;
+
+            // 验证端口范围
+            if (isNaN(port) || port < 1 || port > 65535) return null;
+
+            // 处理 IPv6 地址格式 [...]:port
+            if (domain.startsWith('[')) {
+                const bracketEnd = domain.indexOf(']');
+                if (bracketEnd === -1) return null;
+                const ipv6 = domain.substring(1, bracketEnd);
+                // 验证 IPv6 格式（简化验证）
+                if (!/^([0-9a-fA-F:]+)$/.test(ipv6)) return null;
+                domain = ipv6; // 去除括号，后续处理用
+            }
+
+            // 构建目标 URL
+            let targetUrl;
+            if (domain.includes(':') && !domain.startsWith('[')) {
+                // IPv6 无括号格式
+                targetUrl = `${scheme}://[${domain}]:${port}${remainingPath}`;
+            } else {
+                targetUrl = `${scheme}://${domain}:${port}${remainingPath}`;
+            }
+
+            return { targetUrl, remainingPath };
+        }
+
+        // ==========================================
+        // 🆕 高效 URL 重写引擎（字节扫描风格）
+        // 参考 Go 项目实现，使用 indexOf 代替正则
+        // ==========================================
+        const HTTP_SCHEME = 'http://';
+        const HTTPS_SCHEME = 'https://';
+
+        // 快速扫描文本中的所有 URL 并重写
+        // 替代原有的正则替换，提升性能
+        function fastRewriteUrlsInText(text, targetOrigins, proxyOrigin, safePrefix) {
+            if (!text || typeof text !== 'string') return text;
+
+            // 快速检查是否包含 http
+            let hasHttp = false;
+            for (let i = 0; i < Math.min(text.length, 100); i++) {
+                if (text[i] === 'h' && text.substring(i, i + 4) === 'http') {
+                    hasHttp = true;
+                    break;
+                }
+            }
+            if (!hasHttp) return text;
+
+            const proxyPrefix = proxyOrigin + safePrefix + '/';
+            let result = '';
+            let lastIndex = 0;
+
+            while (true) {
+                // 查找下一个 http:// 或 https://
+                const httpPos = text.indexOf(HTTP_SCHEME, lastIndex);
+                const httpsPos = text.indexOf(HTTPS_SCHEME, lastIndex);
+
+                let pos = -1;
+                let schemeLen = 0;
+
+                if (httpPos >= 0 && (httpsPos < 0 || httpPos <= httpsPos)) {
+                    pos = httpPos;
+                    schemeLen = 7;
+                } else if (httpsPos >= 0) {
+                    pos = httpsPos;
+                    schemeLen = 8;
+                }
+
+                if (pos < 0) {
+                    // 没有更多 URL，追加剩余文本
+                    result += text.substring(lastIndex);
+                    break;
+                }
+
+                // 追加 URL 之前的文本
+                result += text.substring(lastIndex, pos);
+
+                // 找到 URL 结束位置（遇到分隔符停止）
+                let urlEnd = pos + schemeLen;
+                while (urlEnd < text.length) {
+                    const c = text.charCodeAt(urlEnd);
+                    // URL 结束条件：空白、控制字符、引号、括号等
+                    if (c <= 32 || c === 34 || c === 39 || c === 60 || c === 62 ||
+                        c === 40 || c === 41 || c === 123 || c === 125 ||
+                        c === 91 || c === 93 || c === 92 || c === 124 || c === 94 ||
+                        c === 96) {
+                        break;
+                    }
+                    urlEnd++;
+                }
+
+                const rawUrl = text.substring(pos, urlEnd);
+                const rewritten = fastRewriteSingleUrl(rawUrl, targetOrigins, proxyOrigin, safePrefix, proxyPrefix);
+                result += rewritten;
+
+                lastIndex = urlEnd;
+            }
+
+            return result;
+        }
+
+        // 重写单个 URL（高效实现）
+        function fastRewriteSingleUrl(rawUrl, targetOrigins, proxyOrigin, safePrefix, proxyPrefix) {
+            // 快速判断是否已经是代理格式
+            if (rawUrl.startsWith(proxyPrefix)) {
+                return rawUrl;
+            }
+
+            // 提取 origin
+            let origin;
+            try {
+                const parsed = new URL(rawUrl);
+                origin = parsed.origin;
+            } catch (e) {
+                return rawUrl;
+            }
+
+            // 检查是否是目标源站地址
+            if (targetOrigins && Array.isArray(targetOrigins)) {
+                if (!targetOrigins.includes(origin)) {
+                    // 跨源地址，转换为代理格式
+                    return proxyPrefix + rawUrl;
+                }
+}
+
+            // 同源地址，返回原始 URL（保持相对路径由客户端处理）
+            return rawUrl;
+        }
+
+        // ==========================================
+        // 🆕 增强型媒体识别（Go项目风格）
+        // ==========================================
+        const MEDIA_EXTENSIONS = new Set([
+            // 视频
+            'mp4', 'mkv', 'avi', 'ts', 'm3u8', 'm4v', 'webm', 'mov', 'wmv', 'flv', 'ogv',
+            // 音频
+            'mp3', 'flac', 'aac', 'ogg', 'wav', 'm4a', 'opus', 'wma', 'ape',
+            // 图片
+            'jpg', 'jpeg', 'png', 'gif', 'webp', 'ico', 'bmp', 'tiff', 'svg', 'avif',
+            // 字体
+            'woff', 'woff2', 'ttf', 'eot', 'otf',
+            // 字幕
+            'srt', 'ass', 'ssa', 'vtt', 'sub', 'sup',
+            // 其他
+            'zip', 'gz', 'br', 'zst', 'json', 'xml'
+        ]);
+
+        function looksLikeMediaPath(path) {
+            if (!path) return false;
+            const lower = path.toLowerCase();
+
+            // 路径包含媒体关键字
+            if (lower.includes('/videos/') || lower.includes('/audio/') ||
+                lower.includes('/images/') || lower.includes('/items/images') ||
+                lower.includes('/stream')) {
+                return true;
+            }
+
+            // 检查扩展名
+            const dotIdx = lower.lastIndexOf('.');
+            if (dotIdx >= 0 && dotIdx < lower.length - 1) {
+                const ext = lower.substring(dotIdx + 1).split('?')[0].split('#')[0];
+                return MEDIA_EXTENSIONS.has(ext);
+            }
+
+            return false;
+        }
+
+        // 获取请求类型用于日志分级
+        function getRequestCategory(path) {
+            const lower = (path || '').toLowerCase();
+            if (/\/playbackinfo/i.test(lower) || /\/items\//i.test(lower)) return 'API';
+            if (lower.includes('/videos/') || lower.includes('/audio/') || looksLikeMediaPath(lower)) return 'STREAM';
+            if (/socket|websocket/i.test(lower)) return 'WS';
+            return 'PROXY';
+        }
+
         if (decodedPath.startsWith('/http://') || decodedPath.startsWith('/https://')) {
             // 🚫 通用反代访问控制检查
             // 优先从 D1 数据库读取配置，如果失败则使用代码常量
@@ -5041,7 +5185,27 @@ export default {
                     }
                 );
             }
-            targetUrls = [decodedPath.substring(1)]; remainingPath = '';
+
+            // 🆕 支持编码格式通用反代: /{scheme}/{domain}/{port}/{path}
+            if (ENABLE_ENCODED_PROXY_FORMAT) {
+                const encodedResult = parseEncodedProxyUrl(decodedPath);
+                if (encodedResult) {
+                    targetUrls = [encodedResult.targetUrl];
+                    remainingPath = '';
+                    isPassthroughMode = true;
+                    if (ENABLE_DETAILED_LOGGING) {
+                        console.log(`[GENERAL] Encoded proxy: ${decodedPath} -> ${encodedResult.targetUrl}`);
+                    }
+                } else {
+                    // 传统格式: /https://example.com/path
+                    targetUrls = [decodedPath.substring(1)];
+                    remainingPath = '';
+                }
+            } else {
+                // 仅传统格式
+                targetUrls = [decodedPath.substring(1)];
+                remainingPath = '';
+            }
         } else {
             const pathParts = decodedPath.split('/'); const prefix = pathParts[1]; 
             if (!prefix) return new Response(`Not Found`, { status: 404 });
@@ -5177,6 +5341,13 @@ export default {
 
                 try {
                     const modifiedRequest = new Request(targetUrl, fetchInit); const response = await fetch(modifiedRequest);
+
+                    // 🆕 日志分级（可选）
+                    if (ENABLE_DETAILED_LOGGING) {
+                        const category = getRequestCategory(targetUrl.pathname);
+                        const startTime = Date.now();
+                        console.log(`[${category}] ${response.status} ${request.method} ${targetUrl.host}${targetUrl.pathname}${targetUrl.search}`);
+                    }
 
                     // 404/502/503/504 时，尝试同一 target 的下一候选（/emby 回退）
                     if ((response.status === 404 || response.status === 502 || response.status === 503 || response.status === 504) && j < candidateUrls.length - 1) {
