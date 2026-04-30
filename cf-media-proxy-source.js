@@ -1,6 +1,6 @@
-﻿// VERSION: 2.1.0.2
+﻿// VERSION: 2.1.0.3
 // 🟢 面板核心配置区 (放在最顶端方便修改)
-const CURRENT_VERSION = "2.1.0.2";
+const CURRENT_VERSION = "2.1.0.3";
 const GITHUB_RAW_URL = "https://raw.githubusercontent.com/azxcvjj/cf-media-proxy/main/cf-media-proxy.js";
 
 // ==========================================
@@ -276,31 +276,46 @@ const CF_COLO_TO_COUNTRY = {
     // 亚洲
     'SIN': '🇸🇬', 'NRT': '🇯🇵', 'TYO': '🇯🇵', 'KIX': '🇯🇵', 'NGO': '🇯🇵',
     'HKG': '🇭🇰', 'TPE': '🇹🇼', 'KUL': '🇲🇾', 'BKK': '🇹🇭', 'MNL': '🇵🇭',
-    'ICN': '🇰🇷', 'SEL': '🇰🇷', 'PUS': '🇰🇷', 'SIN': '🇸🇬',
-    'DEL': '🇮🇳', 'BOM': '🇮🇳', 'CCU': '🇮🇳', 'MAA': '🇮🇳',
-    'DXB': '🇦🇪', 'DUB': '🇦🇪', 'AUH': '🇦🇪',
-    'JNB': '🇿🇦', 'CPT': '🇿🇦', 'LOS': '🇳🇬',
+    'ICN': '🇰🇷', 'SEL': '🇰🇷', 'PUS': '🇰🇷',
+    'DEL': '🇮🇳', 'BOM': '🇮🇳', 'CCU': '🇮🇳', 'MAA': '🇮🇳', 'BLR': '🇮🇳', 'HYD': '🇮🇳',
+    'DXB': '🇦🇪', 'DUB': '🇦🇪', 'AUH': '🇦🇪', 'SHJ': '🇦🇪',
+    'JNB': '🇿🇦', 'CPT': '🇿🇦', 'LOS': '🇳🇬', 'KGL': '🇷🇼', 'DOH': '🇶🇦',
     // 大洋洲
-    'SYD': '🇦🇺', 'MEL': '🇦🇺', 'BNE': '🇦🇺', 'PER': '🇦🇺', 'AKL': '🇳🇿',
+    'SYD': '🇦🇺', 'MEL': '🇦🇺', 'BNE': '🇦🇺', 'PER': '🇦🇺', 'AKL': '🇳🇿', 'WLG': '🇳🇿',
     // 欧洲
-    'LHR': '🇬🇧', 'LGW': '🇬🇧', 'STN': '🇬🇧', 'MAN': '🇬🇧',
-    'FRA': '🇩🇪', 'MUC': '🇩🇪', 'BER': '🇩🇪',
-    'AMS': '🇳🇱', 'CDG': '🇫🇷', 'PAR': '🇫🇷', 'MAD': '🇪🇸', 'BCN': '🇪🇸',
-    'FCO': '🇮🇹', 'ROM': '🇮🇹', 'MIL': '🇮🇹', 'ZRH': '🇨🇭', 'GVA': '🇨🇭',
-    'VIE': '🇦🇹', 'WAR': '🇵🇱', 'PRG': '🇨🇿', 'CPH': '🇩🇰', 'STO': '🇸🇪',
-    'OSL': '🇳🇴', 'HEL': '🇫🇮', 'DUB': '🇮🇪', 'Lis': '🇵🇹',
+    'LHR': '🇬🇧', 'LGW': '🇬🇧', 'STN': '🇬🇧', 'MAN': '🇬🇧', 'BHX': '🇬🇧', 'GLA': '🇬🇧',
+    'FRA': '🇩🇪', 'MUC': '🇩🇪', 'BER': '🇩🇪', 'DTM': '🇩🇪', 'HAM': '🇩🇪',
+    'AMS': '🇳🇱', 'CDG': '🇫🇷', 'PAR': '🇫🇷', 'LYS': '🇫🇷', 'MRS': '🇫🇷',
+    'MAD': '🇪🇸', 'BCN': '🇪🇸', 'AGP': '🇪🇸', 'VAL': '🇪🇸',
+    'FCO': '🇮🇹', 'ROM': '🇮🇹', 'MIL': '🇮🇹', 'NAP': '🇮🇹', 'TRN': '🇮🇹',
+    'ZRH': '🇨🇭', 'GVA': '🇨🇭', 'BSL': '🇨🇭',
+    'VIE': '🇦🇹', 'WAR': '🇵🇱', 'PRG': '🇨🇿', 'CPH': '🇩🇰', 'STO': '🇸🇪', 'ARN': '🇸🇪',
+    'OSL': '🇳🇴', 'HEL': '🇫🇮', 'DUB': '🇮🇪', 'LIS': '🇵🇹', 'OPO': '🇵🇹',
+    'ATH': '🇬🇷', 'IST': '🇹🇷', 'SAW': '🇹🇷',
     // 北美洲
     'LAX': '🇺🇸', 'SFO': '🇺🇸', 'SEA': '🇺🇸', 'PDX': '🇺🇸', 'LAS': '🇺🇸',
-    'ORD': '🇺🇸', 'CHI': '🇺🇸', 'MSP': '🇺🇸', 'ATL': '🇺🇸', 'IAH': '🇺🇸',
-    'DFW': '🇺🇸', 'DEN': '🇺🇸', 'PHX': '🇺🇸', 'IND': '🇺🇸',
+    'ORD': '🇺🇸', 'MSP': '🇺🇸', 'ATL': '🇺🇸', 'IAH': '🇺🇸', 'BNA': '🇺🇸',
+    'DFW': '🇺🇸', 'DEN': '🇺🇸', 'PHX': '🇺🇸', 'IND': '🇺🇸', 'OKC': '🇺🇸',
     'JFK': '🇺🇸', 'NYC': '🇺🇸', 'BOS': '🇺🇸', 'IAD': '🇺🇸', 'DCA': '🇺🇸',
-    'MIA': '🇺🇸', 'TPA': '🇺🇸', 'MSY': '🇺🇸', 'PHL': '🇺🇸',
+    'MIA': '🇺🇸', 'TPA': '🇺🇸', 'MSY': '🇺🇸', 'PHL': '🇺🇸', 'CLT': '🇺🇸',
+    'SJC': '🇺🇸', 'SAT': '🇺🇸', 'AUS': '🇺🇸', 'SAN': '🇺🇸', 'STL': '🇺🇸',
+    'MCI': '🇺🇸', 'OMA': '🇺🇸', 'MEM': '🇺🇸', 'JAX': '🇺🇸', 'PIT': '🇺🇸',
+    'CLE': '🇺🇸', 'CMH': '🇺🇸', 'RIC': '🇺🇸', 'RDU': '🇺🇸', 'ABQ': '🇺🇸',
+    'SLC': '🇺🇸', 'SMF': '🇺🇸', 'FSD': '🇺🇸', 'BUF': '🇺🇸', 'ANC': '🇺🇸',
+    'HNL': '🇺🇸', 'BGR': '🇺🇸', 'ORF': '🇺🇸', 'TLH': '🇺🇸',
     'YYZ': '🇨🇦', 'YVR': '🇨🇦', 'YUL': '🇨🇦', 'YYC': '🇨🇦', 'YEG': '🇨🇦',
-    'MEX': '🇲🇽', 'LIM': '🇵🇪', 'GRU': '🇧🇷', 'BOG': '🇨🇴', 'SCL': '🇨🇱',
+    'YOW': '🇨🇦', 'YHZ': '🇨🇦', 'YWG': '🇨🇦', 'YXE': '🇨🇦', 'YQM': '🇨🇦',
+    'MEX': '🇲🇽', 'GDL': '🇲🇽', 'MTY': '🇲🇽', 'CUN': '🇲🇽',
+    'LIM': '🇵🇪', 'BOG': '🇨🇴', 'MDE': '🇨🇴', 'SCL': '🇨🇱', 'EZE': '🇦🇷',
+    'GYE': '🇪🇨', 'UIO': '🇪🇨', 'HAV': '🇨🇺', 'SDQ': '🇩🇴', 'SJO': '🇨🇷',
+    'PTY': '🇵🇦', 'GRU': '🇧🇷', 'BSB': '🇧🇷', 'SSA': '🇧🇷', 'FOR': '🇧🇷', 'REC': '🇧🇷',
+    'VCP': '🇧🇷', 'GIG': '🇧🇷', 'POA': '🇧🇷', 'CWB': '🇧🇷', 'MCO': '🇧🇷',
+    'MVD': '🇺🇾', 'SYD': '🇦🇺',
     // 中国大陆 (CF 常用城市代码)
     'PEK': '🇨🇳', 'PVG': '🇨🇳', 'CAN': '🇨🇳', 'SZX': '🇨🇳', 'CTU': '🇨🇳',
     'NKG': '🇨🇳', 'XIY': '🇨🇳', 'HAK': '🇨🇳', 'SYX': '🇨🇳', 'WXN': '🇨🇳',
-    'NJN': '🇨🇳', 'TYN': '🇨🇳', 'TSN': '🇨🇳', 'CKG': '🇨🇳', 'NBO': '🇨🇳',
+    'NJN': '🇨🇳', 'TYN': '🇨🇳', 'TSN': '🇨🇳', 'CKG': '🇨🇳', 'NBO': '🇰🇪',
+    'KTM': '🇳🇵', 'RGN': '🇲🇲', 'CMB': '🇱🇰', 'KHI': '🇵🇰', 'LHE': '🇵🇰', 'ISB': '🇵🇰',
 };
 
 // 获取 Cloudflare 机房代码对应的国旗
@@ -3041,19 +3056,48 @@ const HTML_UI = `
         async function fetchCfTrace() {
             // Cloudflare 机房代码 -> 国家代码映射
             const coloToCountry = {
+                // 亚洲
                 NRT:'jp', TYO:'jp', KIX:'jp', NGO:'jp', SEL:'kr', ICN:'kr', PUS:'kr',
-                SIN:'sg', HKG:'hk', TPE:'tw',
-                LAX:'us', SFO:'us', SEA:'us', PDX:'us', LAS:'us', ORD:'us', ATL:'us', DFW:'us', DEN:'us', IAH:'us', MSP:'us', MIA:'us',
-                LHR:'gb', MAN:'gb', LGW:'gb', STN:'gb',
-                FRA:'de', MUC:'de', BER:'de',
-                AMS:'nl', CDG:'fr', PAR:'fr', MAD:'es', BCN:'es', FCO:'it', ROM:'it', MIL:'it',
-                ZRH:'ch', GVA:'ch', VIE:'at', WAR:'pl', PRG:'cz', CPH:'dk', STO:'se', OSL:'no', HEL:'fi', DUB:'ie', LIS:'pt',
-                SYD:'au', MEL:'au', BNE:'au', PER:'au', AKL:'nz',
-                NBO:'ke', JNB:'za', LOS:'ng', CPT:'za',
-                DEL:'in', BOM:'in', CCU:'in', MAA:'in',
-                DXB:'ae', DUB:'ae', AUH:'ae',
-                KUL:'my', BKK:'th', MNL:'ph',
-                PEK:'cn', PVG:'cn', CAN:'cn', SZX:'cn', CTU:'cn', NKG:'cn', XIY:'cn', CKG:'cn', TYN:'cn', TSN:'cn', NJN:'cn', HAK:'cn', SYX:'cn', WXN:'cn'
+                SIN:'sg', HKG:'hk', TPE:'tw', KUL:'my', BKK:'th', MNL:'ph',
+                DEL:'in', BOM:'in', CCU:'in', MAA:'in', BLR:'in', HYD:'in',
+                DXB:'ae', DUB:'ae', AUH:'ae', SHJ:'ae',
+                JNB:'za', CPT:'za', LOS:'ng', KGL:'rw', DOH:'qa',
+                // 大洋洲
+                SYD:'au', MEL:'au', BNE:'au', PER:'au', AKL:'nz', WLG:'nz',
+                // 欧洲
+                LHR:'gb', MAN:'gb', LGW:'gb', STN:'gb', BHX:'gb', GLA:'gb',
+                FRA:'de', MUC:'de', BER:'de', DTM:'de', HAM:'de',
+                AMS:'nl', CDG:'fr', PAR:'fr', LYS:'fr', MRS:'fr',
+                MAD:'es', BCN:'es', AGP:'es', VAL:'es',
+                FCO:'it', ROM:'it', MIL:'it', NAP:'it', TRN:'it',
+                ZRH:'ch', GVA:'ch', BSL:'ch',
+                VIE:'at', WAR:'pl', PRG:'cz', CPH:'dk', STO:'se', ARN:'se',
+                OSL:'no', HEL:'fi', DUB:'ie', LIS:'pt', OPO:'pt',
+                ATH:'gr', IST:'tr', SAW:'tr',
+                // 北美洲
+                LAX:'us', SFO:'us', SEA:'us', PDX:'us', LAS:'us',
+                ORD:'us', MSP:'us', ATL:'us', IAH:'us', BNA:'us',
+                DFW:'us', DEN:'us', PHX:'us', IND:'us', OKC:'us',
+                JFK:'us', NYC:'us', BOS:'us', IAD:'us', DCA:'us',
+                MIA:'us', TPA:'us', MSY:'us', PHL:'us', CLT:'us',
+                SJC:'us', SAT:'us', AUS:'us', SAN:'us', STL:'us',
+                MCI:'us', OMA:'us', MEM:'us', JAX:'us', PIT:'us',
+                CLE:'us', CMH:'us', RIC:'us', RDU:'us', ABQ:'us',
+                SLC:'us', SMF:'us', FSD:'us', BUF:'us', ANC:'us',
+                HNL:'us', BGR:'us', ORF:'us', TLH:'us',
+                YYZ:'ca', YVR:'ca', YUL:'ca', YYC:'ca', YEG:'ca',
+                YOW:'ca', YHZ:'ca', YWG:'ca', YXE:'ca', YQM:'ca',
+                MEX:'mx', GDL:'mx', MTY:'mx', CUN:'mx',
+                LIM:'pe', BOG:'co', MDE:'co', SCL:'cl', EZE:'ar',
+                GYE:'ec', UIO:'ec', HAV:'cu', SDQ:'do', SJO:'cr',
+                PTY:'pa', GRU:'br', BSB:'br', SSA:'br', FOR:'br', REC:'br',
+                VCP:'br', GIG:'br', POA:'br', CWB:'br', MCO:'br',
+                MVD:'uy',
+                // 中国大陆
+                PEK:'cn', PVG:'cn', CAN:'cn', SZX:'cn', CTU:'cn',
+                NKG:'cn', XIY:'cn', HAK:'cn', SYX:'cn', WXN:'cn',
+                NJN:'cn', TYN:'cn', TSN:'cn', CKG:'cn',
+                NBO:'ke', KTM:'np', RGN:'mm', CMB:'lk', KHI:'pk', LHE:'pk', ISB:'pk'
             };
 
             try {
