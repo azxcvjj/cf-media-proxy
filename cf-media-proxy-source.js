@@ -3355,15 +3355,28 @@ const HTML_UI = `
                 const res = await fetch(GITHUB_RAW_URL + '?t=' + new Date().getTime());
                 if (!res.ok) return;
                 latestCode = await res.text();
-                
-                // 🚀 修复版本检测：匹配 CURRENT_VERSION = "x.x.x" 格式
-                const versionMatch = latestCode.match(/CURRENT_VERSION\s*=\s*["']?([\d.]+)/);
-                if (versionMatch && versionMatch[1]) {
-                    const latestVersion = versionMatch[1];
-                    if (latestVersion !== CURRENT_VERSION) {
-                        document.getElementById('updateAlert').style.display = 'block';
-                        document.getElementById('updateMsg').innerText = '当前版本: v' + CURRENT_VERSION + ' | 发现最新版本: v' + latestVersion + ' (Github)';
+
+                // 简单可靠：从获取的代码中查找 VERSION: x.x.x 格式
+                let latestVersion = null;
+                const versionLineIndex = latestCode.indexOf('VERSION:');
+                if (versionLineIndex !== -1) {
+                    const versionPart = latestCode.substring(versionLineIndex, versionLineIndex + 20);
+                    const versionMatch = versionPart.match(/VERSION:\s*([\d.]+)/);
+                    if (versionMatch) latestVersion = versionMatch[1];
+                }
+                // 备用：从 CURRENT_VERSION= 查找
+                if (!latestVersion) {
+                    const cvIndex = latestCode.indexOf('CURRENT_VERSION=');
+                    if (cvIndex !== -1) {
+                        const cvPart = latestCode.substring(cvIndex, cvIndex + 30);
+                        const cvMatch = cvPart.match(/CURRENT_VERSION[=\s"]+([\d.]+)/);
+                        if (cvMatch) latestVersion = cvMatch[1];
                     }
+                }
+
+                if (latestVersion && latestVersion !== CURRENT_VERSION) {
+                    document.getElementById('updateAlert').style.display = 'block';
+                    document.getElementById('updateMsg').innerText = '当前版本: v' + CURRENT_VERSION + ' | 发现最新版本: v' + latestVersion + ' (Github)';
                 }
             } catch (e) {
                 console.log("检测更新失败:", e);
