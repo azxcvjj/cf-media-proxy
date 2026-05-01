@@ -1,6 +1,6 @@
-﻿// VERSION: 2.1.0.3
+﻿// VERSION: 2.1.0.4
 // 🟢 面板核心配置区 (放在最顶端方便修改)
-const CURRENT_VERSION = "2.1.0.3";
+const CURRENT_VERSION = "2.1.0.4";
 const GITHUB_RAW_URL = "https://raw.githubusercontent.com/azxcvjj/cf-media-proxy/main/cf-media-proxy.js";
 
 // ==========================================
