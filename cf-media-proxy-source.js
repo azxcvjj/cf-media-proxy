@@ -1514,7 +1514,8 @@ const HTML_UI = `
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-    <title>MakkaPakka的反代面板</title>
+    <link rel="icon" href="https://ghfast.top/https://raw.githubusercontent.com/ginibond/ginibond/main/Icons/emby/Emby1.png" type="image/x-icon">
+    <title>Emby反代面板</title>
     <style>${CSS_COMMON}</style>
     <script src="https://cdn.jsdelivr.net/npm/sortablejs@latest/Sortable.min.js"></script>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flag-icons@6.6.6/css/flag-icons.min.css">
