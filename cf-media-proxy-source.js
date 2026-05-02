@@ -3356,21 +3356,33 @@ const HTML_UI = `
                 if (!res.ok) return;
                 latestCode = await res.text();
 
-                // 简单可靠：从获取的代码中查找 VERSION: x.x.x 格式
+                // 简单可靠：从获取的代码中查找 VERSION: x.x.x 格式（纯字符串处理，避免正则问题）
                 let latestVersion = null;
                 const versionLineIndex = latestCode.indexOf('VERSION:');
                 if (versionLineIndex !== -1) {
-                    const versionPart = latestCode.substring(versionLineIndex, versionLineIndex + 20);
-                    const versionMatch = versionPart.match(/VERSION:\s*([\d.]+)/);
-                    if (versionMatch) latestVersion = versionMatch[1];
+                    const versionStart = versionLineIndex + 8; // 跳过 "VERSION:"
+                    let versionEnd = versionStart;
+                    while (versionEnd < latestCode.length && /[0-9.]/.test(latestCode[versionEnd])) {
+                        versionEnd++;
+                    }
+                    if (versionEnd > versionStart) {
+                        latestVersion = latestCode.substring(versionStart, versionEnd);
+                    }
                 }
                 // 备用：从 CURRENT_VERSION= 查找
                 if (!latestVersion) {
                     const cvIndex = latestCode.indexOf('CURRENT_VERSION=');
                     if (cvIndex !== -1) {
-                        const cvPart = latestCode.substring(cvIndex, cvIndex + 30);
-                        const cvMatch = cvPart.match(/CURRENT_VERSION[=\s"]+([\d.]+)/);
-                        if (cvMatch) latestVersion = cvMatch[1];
+                        const cvStart = latestCode.indexOf('"', cvIndex) + 1;
+                        if (cvStart > cvIndex) {
+                            let cvEnd = cvStart;
+                            while (cvEnd < latestCode.length && /[0-9.]/.test(latestCode[cvEnd])) {
+                                cvEnd++;
+                            }
+                            if (cvEnd > cvStart) {
+                                latestVersion = latestCode.substring(cvStart, cvEnd);
+                            }
+                        }
                     }
                 }
 
