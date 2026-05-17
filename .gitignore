@@ -1,0 +1,5 @@
+*
+!.gitignore
+!cf-media-proxy.js
+!cf-media-proxy-source.js
+!README.md
