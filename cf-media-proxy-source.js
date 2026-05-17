@@ -1,6 +1,6 @@
-﻿// VERSION: 2.1.0.4
+﻿// VERSION: 2.1.0.5
 // 🟢 面板核心配置区 (放在最顶端方便修改)
-const CURRENT_VERSION = "2.1.0.4";
+const CURRENT_VERSION = "2.1.0.5";
 const GITHUB_RAW_URL = "https://raw.githubusercontent.com/azxcvjj/cf-media-proxy/main/cf-media-proxy.js";
 
 // ==========================================
@@ -221,7 +221,7 @@ async function queryTrafficByPrefixes(env, routes, startISO, endISO, batchSize =
     }
 
     for (const batch of batches) {
-        const prefixLike = batch.map(r => `{clientRequestPath_like:"/${r.prefix}%"}`).join(',');
+        const prefixLike = batch.map(r => `{clientRequestPath_like:${JSON.stringify('/' + r.prefix + '%')}}`).join(',');
         const graphqlQuery = {
             query: `query {
               viewer {
@@ -267,6 +267,69 @@ async function queryTrafficByPrefixes(env, routes, startISO, endISO, batchSize =
     }
 
     return bytesMap;
+}
+
+function isValidRoutePrefix(prefix) {
+    return typeof prefix === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(prefix);
+}
+
+function isValidRouteMode(mode) {
+    return ['off', 'realip_only', 'dual', 'strict'].includes(mode);
+}
+
+function normalizeHttpUrl(value) {
+    if (typeof value !== 'string') return null;
+    const trimmed = value.trim().replace(/\/+$/g, '');
+    if (!trimmed) return null;
+    try {
+        const parsed = new URL(trimmed);
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+        parsed.hash = '';
+        return parsed.toString().replace(/\/+$/g, '');
+    } catch(e) {
+        return null;
+    }
+}
+
+function validateRouteInput(data, options = {}) {
+    const prefix = String(data?.prefix || '').trim().replace(/^\/+/g, '');
+    if (!isValidRoutePrefix(prefix)) {
+        return { ok: false, error: 'prefix 只能包含字母、数字、下划线或中划线，长度 1-64' };
+    }
+
+    const oldPrefixRaw = String(data?.oldPrefix || '').trim().replace(/^\/+/g, '');
+    const oldPrefix = oldPrefixRaw || '';
+    if (oldPrefix && !isValidRoutePrefix(oldPrefix)) {
+        return { ok: false, error: 'oldPrefix 格式无效' };
+    }
+
+    const targets = String(data?.target || '').split(',').map(normalizeHttpUrl).filter(Boolean);
+    if (targets.length === 0) {
+        return { ok: false, error: '至少需要一个 http/https 源站地址' };
+    }
+    if (targets.length > 8) {
+        return { ok: false, error: '单个节点最多允许 8 条源站线路' };
+    }
+
+    const mode = String(data?.mode || 'off');
+    if (!isValidRouteMode(mode)) {
+        return { ok: false, error: '节点模式无效' };
+    }
+
+    const remark = String(data?.remark || '').trim().slice(0, 128);
+    const icon = data?.icon ? normalizeHttpUrl(String(data.icon)) : '';
+    if (data?.icon && !icon) {
+        return { ok: false, error: '图标地址必须是 http/https URL' };
+    }
+
+    const cache_img = data?.cache_img === 'off' ? 'off' : 'on';
+    const sort_order = Number.isFinite(Number(data?.sort_order)) ? Number(data.sort_order) : (options.defaultSortOrder || 0);
+    const last_play = String(data?.last_play || '').trim().slice(0, 32);
+
+    return {
+        ok: true,
+        route: { oldPrefix, prefix, target: targets.join(','), mode, remark, icon, cache_img, sort_order, last_play }
+    };
 }
 
 // ==========================================
@@ -1973,6 +2036,33 @@ const HTML_UI = `
         let trendChartInstance = null;
         let locationChartInstance = null;
 
+        function escapeHtml(value) {
+            return String(value ?? '').replace(/[&<>"']/g, ch => ({
+                '&': '&amp;',
+                '<': '&lt;',
+                '>': '&gt;',
+                '"': '&quot;',
+                "'": '&#39;'
+            }[ch]));
+        }
+
+        function escapeAttr(value) {
+            return escapeHtml(value).replace(/\x60/g, '&#96;');
+        }
+
+        function jsStringAttr(value) {
+            return escapeAttr(JSON.stringify(String(value ?? '')));
+        }
+
+        function isSafeHttpUrl(value) {
+            try {
+                const parsed = new URL(String(value ?? ''));
+                return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+            } catch(e) {
+                return false;
+            }
+        }
+
         // =====================================
         // 通用反代开关控制
         // =====================================
@@ -2094,7 +2184,7 @@ const HTML_UI = `
                         html += '<div style="' + rowStyle + '">';
                         html += '<div style="display: flex; align-items: center; gap: 8px;">';
                         html += '<span style="' + badgeStyle + '">' + (idx + 1) + '</span>';
-                        html += '<span style="font-weight: 600; font-size: 14px; color: var(--text);">' + r.remark + '</span>';
+                        html += '<span style="font-weight: 600; font-size: 14px; color: var(--text);">' + escapeHtml(r.remark) + '</span>';
                         html += '</div>';
                         html += '<span style="font-family: monospace; font-size: 14px; font-weight: 600; color: var(--primary);">' + r.todayBandwidth + '</span>';
                         html += '</div>';
@@ -2176,11 +2266,11 @@ const HTML_UI = `
                         const tr = document.createElement('tr');
                         const isChina = log.country === 'CN';
                         tr.innerHTML = \`
-                            <td data-label="访问时间" style="font-size:12px; white-space:nowrap;">\${log.timestamp}</td>
-                            <td data-label="目标节点"><span class="badge" style="background:rgba(0,113,227,0.1);color:var(--primary);">\${log.prefix}</span></td>
-                            <td data-label="真实 IP" style="font-family:monospace; font-size:13px; color:var(--text-sec); word-break:break-all;">\${log.ip}</td>
-                            <td data-label="归属地"><span class="badge" style="background:\${isChina ? 'rgba(52,199,89,0.1)' : 'rgba(255,149,0,0.1)'}; color:\${isChina ? '#34c759' : '#ff9500'};">\${isChina ? '中国大陆' : (log.country || 'Unknown')}</span></td>
-                            <td data-label="设备标识 (UA)" style="font-size:12px; color:var(--text-sec); word-break: break-all; white-space: normal; text-align: right; line-height: 1.4;" title="\${log.ua}">\${log.ua}</td>
+                            <td data-label="访问时间" style="font-size:12px; white-space:nowrap;">\${escapeHtml(log.timestamp)}</td>
+                            <td data-label="目标节点"><span class="badge" style="background:rgba(0,113,227,0.1);color:var(--primary);">\${escapeHtml(log.prefix)}</span></td>
+                            <td data-label="真实 IP" style="font-family:monospace; font-size:13px; color:var(--text-sec); word-break:break-all;">\${escapeHtml(log.ip)}</td>
+                            <td data-label="归属地"><span class="badge" style="background:\${isChina ? 'rgba(52,199,89,0.1)' : 'rgba(255,149,0,0.1)'}; color:\${isChina ? '#34c759' : '#ff9500'};">\${escapeHtml(isChina ? '中国大陆' : (log.country || 'Unknown'))}</span></td>
+                            <td data-label="设备标识 (UA)" style="font-size:12px; color:var(--text-sec); word-break: break-all; white-space: normal; text-align: right; line-height: 1.4;" title="\${escapeAttr(log.ua)}">\${escapeHtml(log.ua)}</td>
                         \`;
                         tbody.appendChild(tr);
                     });
@@ -2188,7 +2278,7 @@ const HTML_UI = `
 
             } catch (e) {
                 const errMsg = e.name === 'AbortError' ? '网络超时，CF 接口拥堵，请稍后重试' : e.message;
-                document.getElementById('logTableBody').innerHTML = \`<tr><td colspan="5" style="text-align:center;color:#ff3b30; padding: 30px;">独立图表数据拉取失败: \${errMsg}</td></tr>\`;
+                document.getElementById('logTableBody').innerHTML = \`<tr><td colspan="5" style="text-align:center;color:#ff3b30; padding: 30px;">独立图表数据拉取失败: \${escapeHtml(errMsg)}</td></tr>\`;
             }
         }
 
@@ -2568,7 +2658,17 @@ const HTML_UI = `
                     const remarkName = r.remark || '未命名媒体库';
                     const lastPlay = r.last_play ? r.last_play : '暂无播放记录';
                     
-                    const iconHtml = r.icon ? \`<img src="\${r.icon}" style="width:28px;height:28px;border-radius:6px;object-fit:cover;">\` : '🎬';
+                    const prefixText = String(r.prefix || '');
+                    const targetText = String(r.target || '');
+                    const modeText = String(r.mode || 'off');
+                    const iconText = String(r.icon || '');
+                    const cacheImgText = String(r.cache_img || 'on');
+                    const safePrefixText = escapeHtml(prefixText);
+                    const safePrefixAttr = escapeAttr(prefixText);
+                    const safeRemarkText = escapeHtml(remarkName);
+                    const safeLastPlay = escapeHtml(lastPlay);
+                    const safeModeText = escapeHtml(modeNames[modeText] || '未知');
+                    const iconHtml = iconText && isSafeHttpUrl(iconText) ? \`<img src="\${escapeAttr(iconText)}" style="width:28px;height:28px;border-radius:6px;object-fit:cover;">\` : '🎬';
                     const encodedTargets = encodeURIComponent(JSON.stringify(targets));
                     
                     // 🌟 接收后端传来的：单节点独立宽带与请求统计数据
@@ -2578,29 +2678,29 @@ const HTML_UI = `
                     proxyNodesForPing.push({ idx: idx, url: mainTarget });
 
                     container.innerHTML += \`
-                    <div class="emby-card route-item" data-prefix="\${r.prefix}" data-search="\${remarkName} \${r.prefix}">
+                    <div class="emby-card route-item" data-prefix="\${safePrefixAttr}" data-search="\${escapeAttr(remarkName + ' ' + prefixText)}">
                         <div class="card-header">
                             <div class="card-title-group" style="display: flex; align-items: center; gap: 10px;">
                                 <div class="drag-handle" title="长按拖拽排序" style="margin: 0; display: flex; align-items: center;">☰</div>
-                                <input type="checkbox" class="node-cb" value="\${r.prefix}" style="width: 18px; height: 18px; margin: 0; cursor: pointer; accent-color: var(--primary); flex-shrink: 0;">
+                                <input type="checkbox" class="node-cb" value="\${safePrefixAttr}" style="width: 18px; height: 18px; margin: 0; cursor: pointer; accent-color: var(--primary); flex-shrink: 0;">
                                 <div class="emby-icon" style="margin: 0; display: flex; align-items: center;">\${iconHtml}</div>
                                 <div style="flex: 1; min-width: 0;">
                                     <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
-                                        <span style="font-weight: 600; font-size: 16px; color: var(--text);">\${remarkName}</span>
-                                        <span style="font-size: 11px; padding: 2px 8px; border-radius: 4px; font-weight: 600; background: \${modeColors[r.mode]?.bg || 'rgba(59, 130, 246, 0.1)'}; color: \${modeColors[r.mode]?.color || '#3b82f6'};">\${modeNames[r.mode] || '未知'}</span>
+                                        <span style="font-weight: 600; font-size: 16px; color: var(--text);">\${safeRemarkText}</span>
+                                        <span style="font-size: 11px; padding: 2px 8px; border-radius: 4px; font-weight: 600; background: \${modeColors[modeText]?.bg || 'rgba(59, 130, 246, 0.1)'}; color: \${modeColors[modeText]?.color || '#3b82f6'};">\${safeModeText}</span>
                                     </div>
-                                    <div style="font-size: 13px; color: var(--text-sec); margin-top:2px;">/\${r.prefix}</div>
+                                    <div style="font-size: 13px; color: var(--text-sec); margin-top:2px;">/\${safePrefixText}</div>
                                 </div>
                             </div>
-                            <button class="icon-btn" onclick="copyWithAnim(this, '\${proxyUrl}')" title="复制直达链接" style="width: 36px; height: 36px; flex-shrink: 0;">${SVG_COPY}</button>
+                            <button class="icon-btn" onclick="copyWithAnim(this, \${jsStringAttr(proxyUrl)})" title="复制直达链接" style="width: 36px; height: 36px; flex-shrink: 0;">${SVG_COPY}</button>
                         </div>
 
                         <div class="card-summary" style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px;">
                             <div style="display: flex; gap: 16px; align-items: center; flex-wrap: wrap;">
-                                <span id="ping-\${idx}" class="ping-badge" onclick="pingTarget(\${idx}, '\${mainTarget}')" title="点击重新测速" style="font-size: 12px;">测速中...</span>
-                                <span style="font-size: 13px; color: var(--text-sec); display: flex; align-items: center; gap: 4px;">${SVG_DOWN_ARROW} \${todayBw}</span>
-                                <span style="font-size: 13px; color: var(--text-sec); display: flex; align-items: center; gap: 4px;">📺 \${r.todayReqs}/\${totalReqs}</span>
-                                <span style="font-size: 12px; color: var(--text-muted);">最后活跃: \${lastPlay}</span>
+                                <span id="ping-\${idx}" class="ping-badge" onclick="pingTarget(\${idx}, \${jsStringAttr(mainTarget)})" title="点击重新测速" style="font-size: 12px;">测速中...</span>
+                                <span style="font-size: 13px; color: var(--text-sec); display: flex; align-items: center; gap: 4px;">${SVG_DOWN_ARROW} \${escapeHtml(todayBw)}</span>
+                                <span style="font-size: 13px; color: var(--text-sec); display: flex; align-items: center; gap: 4px;">📺 \${escapeHtml(r.todayReqs)}/\${escapeHtml(totalReqs)}</span>
+                                <span style="font-size: 12px; color: var(--text-muted);">最后活跃: \${safeLastPlay}</span>
                             </div>
                             <button class="btn-expand" onclick="toggleCardExpand(this)" data-expanded="false" style="background: transparent; border: 1px solid var(--border); border-radius: 8px; padding: 6px 12px; cursor: pointer; font-size: 12px; color: var(--text-sec); display: flex; align-items: center; gap: 4px;">
                                 <span>详情</span>
@@ -2613,14 +2713,14 @@ const HTML_UI = `
                                 <div class="info-row">
                                     <span class="info-label">直达链接:</span>
                                     <div class="action-group" style="flex:1; justify-content: flex-end; margin-left: 10px; align-items: flex-start;">
-                                        <span id="p-\${idx}" data-val="\${proxyUrl}" class="secret-text dynamic-url">••••••••</span>
+                                        <span id="p-\${idx}" data-val="\${escapeAttr(proxyUrl)}" class="secret-text dynamic-url">••••••••</span>
                                         <button class="icon-btn" style="margin-top: 2px;" onclick="toggleVis('p-\${idx}')" title="查看明文">${SVG_EYE}</button>
                                     </div>
                                 </div>
                                 <div class="info-row">
                                     <span class="info-label">源站线路:</span>
                                     <div class="action-group" style="flex:1; justify-content: flex-end; margin-left: 10px; align-items: flex-start;">
-                                        <div id="t-\${idx}" data-val="\${encodedTargets}" class="secret-text dynamic-url">••••••••</div>
+                                        <div id="t-\${idx}" data-val="\${escapeAttr(encodedTargets)}" class="secret-text dynamic-url">••••••••</div>
                                         <button class="icon-btn" style="margin-top: 2px;" onclick="toggleVis('t-\${idx}', true)" title="查看明文">${SVG_EYE}</button>
                                     </div>
                                 </div>
@@ -2631,8 +2731,8 @@ const HTML_UI = `
                             </div>
 
                             <div class="card-footer" style="margin-top: 16px;">
-                                <button class="btn-edit" onclick="editNode('\${r.prefix}', '\${r.target}', '\${r.mode}', '\${r.remark || ''}', '\${r.icon || ''}', '\${r.cache_img}')">编辑配置</button>
-                                <button class="btn-del" onclick="del('\${r.prefix}')">删除</button>
+                                <button class="btn-edit" onclick="editNode(\${jsStringAttr(prefixText)}, \${jsStringAttr(targetText)}, \${jsStringAttr(modeText)}, \${jsStringAttr(r.remark || '')}, \${jsStringAttr(iconText)}, \${jsStringAttr(cacheImgText)})">编辑配置</button>
+                                <button class="btn-del" onclick="del(\${jsStringAttr(prefixText)})">删除</button>
                             </div>
                         </div>
                     </div>\`;
@@ -3913,6 +4013,31 @@ export default {
     async fetch(request, env, ctx) {
         const url = new URL(request.url);
 
+        function getCookie(req, name) {
+            const cookieString = req.headers.get("Cookie");
+            if (!cookieString) return null;
+            const match = cookieString.match(new RegExp('(^| )' + name + '=([^;]+)'));
+            if (match) return decodeURIComponent(match[2]);
+            return null;
+        }
+
+        const EXPECTED_TOKEN = env.ADMIN_TOKEN;
+        const isPublicEndpoint = request.method === "OPTIONS"
+            || url.pathname === '/api/tg-webhook'
+            || url.pathname === '/__client_rtt__';
+        const isPanelOrApi = url.pathname === '/' || url.pathname.startsWith('/api/');
+
+        if (!isPublicEndpoint) {
+            if (!EXPECTED_TOKEN) return new Response("请在 Worker 变量中配置 ADMIN_TOKEN", { status: 500 });
+            if (isPanelOrApi) {
+                const providedToken = getCookie(request, 'admin_token');
+                if (providedToken !== EXPECTED_TOKEN) {
+                    if (url.pathname === '/') return new Response(LOGIN_UI, { headers: { "Content-Type": "text/html;charset=UTF-8" } });
+                    return new Response('Unauthorized', { status: 401 });
+                }
+            }
+        }
+
         // ==========================================
         // 🚀 新增：全云厂商 Worker 放置区域接口
         // ==========================================
@@ -4144,26 +4269,6 @@ export default {
 
         if (request.method === "OPTIONS") {
             return new Response(null, { headers: { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS", "Access-Control-Allow-Headers": "*", "Access-Control-Max-Age": "86400" } });
-        }
-
-        const EXPECTED_TOKEN = env.ADMIN_TOKEN;
-        if (!EXPECTED_TOKEN) return new Response("请在 Worker 变量中配置 ADMIN_TOKEN", { status: 500 });
-
-        function getCookie(req, name) {
-            const cookieString = req.headers.get("Cookie");
-            if (!cookieString) return null;
-            const match = cookieString.match(new RegExp('(^| )' + name + '=([^;]+)'));
-            if (match) return decodeURIComponent(match[2]);
-            return null;
-        }
-
-        const isPanelOrApi = url.pathname === '/' || url.pathname.startsWith('/api/');
-        if (isPanelOrApi && url.pathname !== '/api/tg-webhook') {
-            const providedToken = getCookie(request, 'admin_token');
-            if (providedToken !== EXPECTED_TOKEN) {
-                if (url.pathname === '/') return new Response(LOGIN_UI, { headers: { "Content-Type": "text/html;charset=UTF-8" } });
-                else return new Response('Unauthorized', { status: 401 });
-            }
         }
 
         if (url.pathname === '/') {
@@ -4424,6 +4529,12 @@ export default {
             if (!env.DB) return Response.json({ success: false, error: "未绑定 DB" });
             try {
                 const items = await request.json(); 
+                if (!Array.isArray(items)) return Response.json({ success: false, error: 'Invalid parameters' }, { status: 400 });
+                for (const item of items) {
+                    if (!isValidRoutePrefix(String(item?.prefix || '')) || !Number.isFinite(Number(item?.sort_order))) {
+                        return Response.json({ success: false, error: 'Invalid route order item' }, { status: 400 });
+                    }
+                }
                 const stmts = items.map(item => env.DB.prepare('UPDATE routes SET sort_order = ? WHERE prefix = ?').bind(item.sort_order, item.prefix));
                 await env.DB.batch(stmts);
                 return Response.json({ success: true });
@@ -4434,10 +4545,14 @@ export default {
             if (!env.DB) return Response.json({ success: false, error: "未绑定 DB" });
             try {
                 const routes = await request.json();
-                for (const r of routes) {
+                if (!Array.isArray(routes)) return Response.json({ success: false, error: '导入内容必须是数组' }, { status: 400 });
+                for (const [index, r] of routes.entries()) {
                     if (r.prefix && r.target) {
+                        const validated = validateRouteInput(r);
+                        if (!validated.ok) return Response.json({ success: false, error: `第 ${index + 1} 条配置无效: ${validated.error}` }, { status: 400 });
+                        const route = validated.route;
                         await env.DB.prepare('INSERT OR REPLACE INTO routes (prefix, target, mode, remark, last_play, icon, cache_img, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-                            .bind(r.prefix, r.target, r.mode || 'off', r.remark || '', r.last_play || '', r.icon || '', r.cache_img || 'on', r.sort_order || 0).run();
+                            .bind(route.prefix, route.target, route.mode, route.remark, route.last_play, route.icon, route.cache_img, route.sort_order).run();
                     }
                 }
                 return Response.json({ success: true });
@@ -4502,17 +4617,20 @@ export default {
             
             if (request.method === 'POST') {
                 const data = await request.json(); let currentSortOrder = 0;
-                if (data.oldPrefix && data.oldPrefix !== data.prefix) {
-                    const oldRow = await env.DB.prepare('SELECT sort_order FROM routes WHERE prefix = ?').bind(data.oldPrefix).first();
+                const validated = validateRouteInput(data);
+                if (!validated.ok) return Response.json({ success: false, error: validated.error }, { status: 400 });
+                const route = validated.route;
+                if (route.oldPrefix && route.oldPrefix !== route.prefix) {
+                    const oldRow = await env.DB.prepare('SELECT sort_order FROM routes WHERE prefix = ?').bind(route.oldPrefix).first();
                     if(oldRow) currentSortOrder = oldRow.sort_order;
-                    await env.DB.prepare('DELETE FROM routes WHERE prefix = ?').bind(data.oldPrefix).run();
+                    await env.DB.prepare('DELETE FROM routes WHERE prefix = ?').bind(route.oldPrefix).run();
                 } else {
-                    const oldRow = await env.DB.prepare('SELECT sort_order FROM routes WHERE prefix = ?').bind(data.prefix).first();
+                    const oldRow = await env.DB.prepare('SELECT sort_order FROM routes WHERE prefix = ?').bind(route.prefix).first();
                     if(oldRow) currentSortOrder = oldRow.sort_order;
                 }
 
                 await env.DB.prepare('INSERT OR REPLACE INTO routes (prefix, target, mode, remark, icon, cache_img, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?)')
-                    .bind(data.prefix, data.target, data.mode || 'off', data.remark || '', data.icon || '', data.cache_img || 'on', currentSortOrder).run();
+                    .bind(route.prefix, route.target, route.mode, route.remark, route.icon, route.cache_img, currentSortOrder).run();
                 return Response.json({ success: true });
             }
 
@@ -4520,6 +4638,9 @@ export default {
             if (request.method === 'PUT') {
                 const data = await request.json();
                 if (data.prefixes && Array.isArray(data.prefixes) && data.mode !== undefined) {
+                    if (!isValidRouteMode(String(data.mode)) || data.prefixes.some(prefix => !isValidRoutePrefix(String(prefix || '')))) {
+                        return Response.json({ success: false, error: 'Invalid parameters' }, { status: 400 });
+                    }
                     const placeholders = data.prefixes.map(() => '?').join(',');
                     await env.DB.prepare(`UPDATE routes SET mode = ? WHERE prefix IN (${placeholders})`)
                         .bind(data.mode, ...data.prefixes).run();
@@ -4529,7 +4650,9 @@ export default {
             }
 
             if (request.method === 'DELETE') {
-                const prefix = url.searchParams.get('prefix'); await env.DB.prepare('DELETE FROM routes WHERE prefix = ?').bind(prefix).run(); return Response.json({ success: true });
+                const prefix = url.searchParams.get('prefix');
+                if (!isValidRoutePrefix(String(prefix || ''))) return Response.json({ success: false, error: 'Invalid prefix' }, { status: 400 });
+                await env.DB.prepare('DELETE FROM routes WHERE prefix = ?').bind(prefix).run(); return Response.json({ success: true });
             }
             return new Response("Method not allowed", { status: 405 });
         }
@@ -5443,7 +5566,7 @@ export default {
         // ==========================================
         if ([301, 302, 303, 307, 308].includes(finalResponse.status)) {
             const location = responseHeaders.get('Location');
-            const rewrittenLocation = rewriteRedirectLocation(location, null, targetOrigins, proxyOrigin, safePrefix);
+            const rewrittenLocation = rewriteRedirectLocation(location, finalTargetUrl, targetOrigins, proxyOrigin, safePrefix);
             if (rewrittenLocation !== location) {
                 responseHeaders.set('Location', rewrittenLocation);
             }
