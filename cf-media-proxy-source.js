@@ -1,6 +1,6 @@
-﻿// VERSION: 2.1.0.7
+// VERSION: 2.1.0.8
 // 🟢 面板核心配置区 (放在最顶端方便修改)
-const CURRENT_VERSION = "2.1.0.7";
+const CURRENT_VERSION = "2.1.0.8";
 const GITHUB_RAW_URL = "https://raw.githubusercontent.com/azxcvjj/cf-media-proxy/main/cf-media-proxy.js";
 
 // ==========================================
@@ -217,6 +217,9 @@ function logError(context, error, details = {}) {
 // 返回 Map<prefix, bytes>
 async function queryTrafficByPrefixes(env, routes, startISO, endISO, batchSize = 10) {
     const bytesMap = new Map(routes.map(r => [r.prefix, 0]));
+    const batchTimeoutMs = 2500;
+    const totalBudgetMs = 8000;
+    const deadline = Date.now() + totalBudgetMs;
     
     // 分批查询避免 GraphQL 复杂度限制
     const batches = [];
@@ -225,6 +228,10 @@ async function queryTrafficByPrefixes(env, routes, startISO, endISO, batchSize =
     }
 
     for (const batch of batches) {
+        if (Date.now() > deadline) {
+            console.warn('GraphQL query budget exceeded, return partial traffic data.');
+            break;
+        }
         const prefixLike = batch.map(r => `{clientRequestPath_like:${JSON.stringify('/' + r.prefix + '%')}}`).join(',');
         const graphqlQuery = {
             query: `query {
@@ -246,11 +253,15 @@ async function queryTrafficByPrefixes(env, routes, startISO, endISO, batchSize =
             }`
         };
 
+        let timeoutId = null;
         try {
+            const controller = new AbortController();
+            timeoutId = setTimeout(() => controller.abort(), batchTimeoutMs);
             const cfRes = await fetch('https://api.cloudflare.com/client/v4/graphql', {
                 method: 'POST',
                 headers: { 'Authorization': `Bearer ${env.CF_API_TOKEN}`, 'Content-Type': 'application/json' },
-                body: JSON.stringify(graphqlQuery)
+                body: JSON.stringify(graphqlQuery),
+                signal: controller.signal
             });
 
             const cfData = await cfRes.json();
@@ -270,7 +281,13 @@ async function queryTrafficByPrefixes(env, routes, startISO, endISO, batchSize =
                 });
             });
         } catch(e) {
-            console.error('GraphQL query failed:', e.message);
+            if (e && e.name === 'AbortError') {
+                console.error('GraphQL query timeout, skip this batch.');
+            } else {
+                console.error('GraphQL query failed:', e.message);
+            }
+        } finally {
+            if (timeoutId !== null) clearTimeout(timeoutId);
         }
     }
 
@@ -2792,13 +2809,20 @@ const HTML_UI = `
             if (el.classList.contains('secret-text')) {
                 el.classList.remove('secret-text'); el.classList.add('actual-text');
                 if (isArray) {
-                    const arr = JSON.parse(decodeURIComponent(el.getAttribute('data-val')));
+                    let arr = [];
+                    try {
+                        arr = JSON.parse(decodeURIComponent(el.getAttribute('data-val') || '[]'));
+                        if (!Array.isArray(arr)) arr = [];
+                    } catch (e) {
+                        arr = [];
+                    }
                     let html = '';
                     arr.forEach((t, i) => {
                         const tag = i === 0 ? '<span style="color:#34c759;font-weight:bold;">[主]</span>' : '<span style="color:#ff9500;font-weight:bold;">[备]</span>';
                         html += \`<div class="url-list-item">\${tag} \${t}</div>\`;
                     });
-                    el.innerHTML = html;
+                    if (html) el.innerHTML = html;
+                    else el.textContent = el.getAttribute('data-val') || '';
                 } else { el.textContent = el.getAttribute('data-val'); }
             } else {
                 el.classList.add('secret-text'); el.classList.remove('actual-text'); el.textContent = '••••••••';
@@ -2906,8 +2930,11 @@ const HTML_UI = `
         }
 
         async function load() {
+            let timeoutId = null;
             try {
-                const res = await fetch('/api/routes');
+                const controller = new AbortController();
+                timeoutId = setTimeout(() => controller.abort(), 12000);
+                const res = await fetch('/api/routes', { signal: controller.signal });
                 if (!res.ok) throw new Error('请求失败，请检查环境配置');
                 const data = await res.json();
                 if (data.error) throw new Error(data.error);
@@ -3038,6 +3065,30 @@ const HTML_UI = `
 
             } catch (err) {
                 document.getElementById('list-grid').innerHTML = \`<div style="text-align:center; color:#ff3b30; font-weight:600; grid-column: 1 / -1; padding: 20px;">⚠️ 读取失败: \${escapeHtml(err.message)}</div>\`;
+            } finally {
+                if (timeoutId !== null) clearTimeout(timeoutId);
+            }
+        }
+
+        async function loadWithGuard() {
+            const container = document.getElementById('list-grid');
+            const loadingWatchdog = setTimeout(() => {
+                const text = (container?.innerText || '').trim();
+                if (text.includes('加载中')) {
+                    container.innerHTML = '<div style="text-align:center; color:#ff9500; font-weight:600; grid-column: 1 / -1; padding: 20px;">⚠️ 初始化超时，正在重试...</div>';
+                }
+            }, 10000);
+
+            await load();
+            clearTimeout(loadingWatchdog);
+
+            const afterText = (container?.innerText || '').trim();
+            if (!afterText || afterText.includes('加载中')) {
+                try {
+                    await load();
+                } catch (e) {
+                    console.warn('load retry failed:', e.message || e);
+                }
             }
         }
 
@@ -3512,7 +3563,7 @@ const HTML_UI = `
         // 当网页加载完成时，延迟0.5秒执行探针扫描（避免卡顿主页渲染）
         window.addEventListener('DOMContentLoaded', () => {
             setTimeout(fetchCfTrace, 500);
-            load(); // 节点列表在首页加载时就要获取
+            loadWithGuard(); // 节点列表在首页加载时就要获取（带超时兜底重试）
         });
     // 🚀 新增：全云厂商节点数据库 (包含 Cloudflare 支持的所有主要区域)
         var cfRegions = {
@@ -3733,41 +3784,21 @@ const HTML_UI = `
         
         let latestCode = ""; 
 
+        function extractVersionFromCode(codeText) {
+            if (typeof codeText !== 'string' || !codeText) return null;
+            const versionCommentMatch = codeText.match(/^\\s*\\/\\/\\s*VERSION:\\s*([0-9]+(?:\\.[0-9]+)+)\\s*$/m);
+            if (versionCommentMatch) return versionCommentMatch[1];
+            const currentVersionMatch = codeText.match(/CURRENT_VERSION\\s*=\\s*['"]([0-9]+(?:\\.[0-9]+)+)['"]/);
+            if (currentVersionMatch) return currentVersionMatch[1];
+            return null;
+        }
+
         async function checkForUpdates() {
             try {
                 const res = await fetch(GITHUB_RAW_URL + '?t=' + new Date().getTime());
                 if (!res.ok) return;
                 latestCode = await res.text();
-
-                // 简单可靠：从获取的代码中查找 VERSION: x.x.x 格式（纯字符串处理，避免正则问题）
-                let latestVersion = null;
-                const versionLineIndex = latestCode.indexOf('VERSION:');
-                if (versionLineIndex !== -1) {
-                    const versionStart = versionLineIndex + 8; // 跳过 "VERSION:"
-                    let versionEnd = versionStart;
-                    while (versionEnd < latestCode.length && /[0-9.]/.test(latestCode[versionEnd])) {
-                        versionEnd++;
-                    }
-                    if (versionEnd > versionStart) {
-                        latestVersion = latestCode.substring(versionStart, versionEnd);
-                    }
-                }
-                // 备用：从 CURRENT_VERSION= 查找
-                if (!latestVersion) {
-                    const cvIndex = latestCode.indexOf('CURRENT_VERSION=');
-                    if (cvIndex !== -1) {
-                        const cvStart = latestCode.indexOf('"', cvIndex) + 1;
-                        if (cvStart > cvIndex) {
-                            let cvEnd = cvStart;
-                            while (cvEnd < latestCode.length && /[0-9.]/.test(latestCode[cvEnd])) {
-                                cvEnd++;
-                            }
-                            if (cvEnd > cvStart) {
-                                latestVersion = latestCode.substring(cvStart, cvEnd);
-                            }
-                        }
-                    }
-                }
+                const latestVersion = extractVersionFromCode(latestCode);
 
                 if (latestVersion && latestVersion !== CURRENT_VERSION) {
                     document.getElementById('updateAlert').style.display = 'block';
@@ -4299,7 +4330,13 @@ export default {
             const cookieString = req.headers.get("Cookie");
             if (!cookieString) return null;
             const match = cookieString.match(new RegExp('(^| )' + name + '=([^;]+)'));
-            if (match) return decodeURIComponent(match[2]);
+            if (match) {
+                try {
+                    return decodeURIComponent(match[2]);
+                } catch (e) {
+                    return null;
+                }
+            }
             return null;
         }
 
@@ -4632,15 +4669,7 @@ export default {
                     }
                 }
 
-                const preservedBindings = [];
-                // 2. 备份普通的字符串变量
-                for (const key in env) {
-                    if (typeof env[key] === 'string') {
-                        preservedBindings.push({ name: key, type: 'plain_text', text: env[key] });
-                    }
-                }
-
-                // 3. 拉取 D1、KV 等高级绑定并无损合并
+                // 2. 拉取并复用当前 Worker 绑定，避免把 secret 降级成 plain_text
                 const bindingsRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/scripts/${workerName}/bindings`, {
                     headers: { 'Authorization': `Bearer ${cfToken}` }
                 });
@@ -4648,11 +4677,25 @@ export default {
                 if (!bindingsData.success) {
                     throw new Error(formatCloudflareApiError(bindingsData.errors, bindingsRes.status, '读取 Worker 绑定'));
                 }
+                const preservedBindings = [];
                 if (Array.isArray(bindingsData.result)) {
                     for (const b of bindingsData.result) {
-                        if (b.type !== 'plain_text' && b.type !== 'secret_text' && b.type !== 'inherited') {
-                            preservedBindings.push(b);
+                        if (!b || typeof b !== 'object' || !b.type || !b.name) continue;
+                        if (b.type === 'secret_text') {
+                            // secret 值无法通过 API 读回，使用 inherit 继承上一版本，避免明文回填
+                            preservedBindings.push({ type: 'inherit', name: b.name });
+                            continue;
                         }
+                        if (b.type === 'plain_text') {
+                            if (typeof b.text === 'string') {
+                                preservedBindings.push({ type: 'plain_text', name: b.name, text: b.text });
+                            } else if (typeof env[b.name] === 'string') {
+                                // 少数账号返回 plain_text 可能不带 text，兼容兜底
+                                preservedBindings.push({ type: 'plain_text', name: b.name, text: env[b.name] });
+                            }
+                            continue;
+                        }
+                        preservedBindings.push(b);
                     }
                 }
 
@@ -4669,7 +4712,7 @@ export default {
                 formData.append('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }), 'metadata.json');
                 formData.append('worker.js', new Blob([body.newCode], { type: 'application/javascript+module' }), 'worker.js');
 
-                const cfUrl = `https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/scripts/${workerName}`;
+                const cfUrl = `https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/scripts/${workerName}?bindings_inherit=strict`;
                 const res = await fetch(cfUrl, {
                     method: 'PUT',
                     headers: { 'Authorization': `Bearer ${cfToken}` },
@@ -4722,11 +4765,17 @@ export default {
         }
 
         if (url.pathname === '/api/update-dns' && request.method === 'POST') {
-            const body = await request.json(); const ips = body.ips;
             const cfToken = env.CF_API_TOKEN; const zoneId = env.CF_ZONE_ID; const domain = env.CF_DOMAIN;
 
             if (!cfToken || !zoneId || !domain) return Response.json({ success: false, error: '缺少 DNS 环境变量' });
             try {
+                let body = {};
+                try {
+                    body = await request.json();
+                } catch (e) {
+                    return Response.json({ success: false, error: '请求体必须是合法 JSON' }, { status: 400 });
+                }
+                const ips = body.ips;
                 const validated = validateDnsRecordInputs(ips);
                 if (!validated.ok) return Response.json({ success: false, error: validated.error }, { status: 400 });
 
@@ -4743,7 +4792,15 @@ export default {
                     proxied: record.proxied === true
                 }));
                 let deletedOldRecords = false;
+                const createdNewRecordIds = [];
                 const rollback = async () => {
+                    // 先移除本次已创建的新记录，避免出现新旧记录混合
+                    if (createdNewRecordIds.length > 0) {
+                        await Promise.allSettled(createdNewRecordIds.map(id => fetch(`https://api.cloudflare.com/client/v4/zones/${zoneId}/dns_records/${id}`, {
+                            method: 'DELETE',
+                            headers: { 'Authorization': `Bearer ${cfToken}` }
+                        })));
+                    }
                     if (!deletedOldRecords || rollbackRecords.length === 0) return;
                     await Promise.allSettled(rollbackRecords.map(record => fetch(`https://api.cloudflare.com/client/v4/zones/${zoneId}/dns_records`, {
                         method: 'POST',
@@ -4769,6 +4826,7 @@ export default {
                         await rollback();
                         throw new Error(formatCloudflareApiError(postData.errors, postRes.status, `提交 DNS 记录 ${record.content}`));
                     }
+                    if (postData?.result?.id) createdNewRecordIds.push(postData.result.id);
                 }
                 return Response.json({ success: true, message: `✅ 成功！` });
             } catch (error) { return Response.json({ success: false, error: error.message }); }
@@ -4933,7 +4991,13 @@ export default {
             }
             
             if (request.method === 'POST') {
-                const data = await request.json(); let currentSortOrder = 0;
+                let data = {};
+                try {
+                    data = await request.json();
+                } catch (e) {
+                    return Response.json({ success: false, error: '请求体必须是合法 JSON' }, { status: 400 });
+                }
+                let currentSortOrder = 0;
                 const validated = validateRouteInput(data);
                 if (!validated.ok) return Response.json({ success: false, error: validated.error }, { status: 400 });
                 const route = validated.route;
@@ -4953,7 +5017,12 @@ export default {
 
             // 批量更新模式
             if (request.method === 'PUT') {
-                const data = await request.json();
+                let data = {};
+                try {
+                    data = await request.json();
+                } catch (e) {
+                    return Response.json({ success: false, error: '请求体必须是合法 JSON' }, { status: 400 });
+                }
                 if (data.prefixes && Array.isArray(data.prefixes) && data.mode !== undefined) {
                     if (!isValidRouteMode(String(data.mode)) || data.prefixes.some(prefix => !isValidRoutePrefix(String(prefix || '')))) {
                         return Response.json({ success: false, error: 'Invalid parameters' }, { status: 400 });
@@ -4978,7 +5047,13 @@ export default {
         // 2.6 核心反代与调度引擎
         // ==========================================
         let targetUrls = []; let currentMode = 'off'; let enableCache = true; let remainingPath = '';
-        const decodedPath = decodeURIComponent(url.pathname); let matchedPrefix = null;
+        let decodedPath = '';
+        try {
+            decodedPath = decodeURIComponent(url.pathname);
+        } catch (e) {
+            return new Response("Bad Request: invalid URL encoding", { status: 400 });
+        }
+        let matchedPrefix = null;
         let proxyOrigin = new URL(request.url).origin;
         let isPassthroughMode = false; // 标记是否为 URL 透传模式，透传模式下不重写响应中的媒体 URL
 
@@ -5402,11 +5477,11 @@ export default {
                 return toWorkerPlaybackPath(trimmedValue, '', '', safePrefix);
             }
 
-            // 处理不带斜杠前缀的路径，可能是损坏的绝对 URL（如 embxhttps://...）
-            // 尝试检测并修复这种情况
-            if (/^[a-z]+\https?:\/\//i.test(trimmedValue)) {
-                // 匹配 embxhttps://... 或类似的损坏 URL
-                const fixed = trimmedValue.replace(/^([a-z]+)(\https?:\/\/)/i, '$1/$2');
+            // 处理被污染的绝对 URL（如 embyhttps://...）：
+            // 只提取后半段真实的 http(s)://...，避免影响正常 /emby/... 或 /videos/... 路径。
+            const damagedAbsoluteMatch = trimmedValue.match(/^[a-z][a-z0-9+.-]*(https?:\/\/.+)$/i);
+            if (damagedAbsoluteMatch) {
+                const fixed = damagedAbsoluteMatch[1];
                 try {
                     const parsed = new URL(fixed);
                     if (Array.isArray(targetOrigins) && !targetOrigins.includes(parsed.origin)) {
@@ -5650,7 +5725,10 @@ export default {
             return 'PROXY';
         }
 
-        if (decodedPath.startsWith('/http://') || decodedPath.startsWith('/https://')) {
+        const isLegacyGeneralProxyPath = decodedPath.startsWith('/http://') || decodedPath.startsWith('/https://');
+        const isEncodedGeneralProxyPath = ENABLE_ENCODED_PROXY_FORMAT && /^\/https?\/[^\/]+\/\d+(?:\/|$)/i.test(decodedPath);
+
+        if (isLegacyGeneralProxyPath || isEncodedGeneralProxyPath) {
             // 🚫 通用反代访问控制检查
             // 优先从 D1 数据库读取配置，如果失败则使用代码常量
             let isAllowed = ALLOW_GENERAL_PROXY;
@@ -5706,10 +5784,25 @@ export default {
                     if (ENABLE_DETAILED_LOGGING) {
                         console.log(`[GENERAL] Encoded proxy: ${decodedPath} -> ${encodedResult.targetUrl}`);
                     }
-                } else {
+                } else if (isLegacyGeneralProxyPath) {
                     // 传统格式: /https://example.com/path
                     targetUrls = [decodedPath.substring(1)];
                     remainingPath = '';
+                } else {
+                    return new Response(
+                        JSON.stringify({
+                            error: "通用反代地址格式无效",
+                            message: "编码格式应为 /https/{domain}/{port}/{path} 或 /http/{domain}/{port}/{path}",
+                            hint: "例如: /https/example.com/443/emby/Items"
+                        }),
+                        {
+                            status: 400,
+                            headers: {
+                                "Content-Type": "application/json;charset=UTF-8",
+                                "Access-Control-Allow-Origin": "*"
+                            }
+                        }
+                    );
                 }
             } else {
                 // 仅传统格式
