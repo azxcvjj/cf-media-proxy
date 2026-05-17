@@ -1,6 +1,6 @@
-﻿// VERSION: 2.1.0.5
+﻿// VERSION: 2.1.0.7
 // 🟢 面板核心配置区 (放在最顶端方便修改)
-const CURRENT_VERSION = "2.1.0.5";
+const CURRENT_VERSION = "2.1.0.7";
 const GITHUB_RAW_URL = "https://raw.githubusercontent.com/azxcvjj/cf-media-proxy/main/cf-media-proxy.js";
 
 // ==========================================
@@ -34,6 +34,10 @@ const ENABLE_DETAILED_LOGGING = false;
 const DATE_FILTER_CST = "date(timestamp, '+8 hours') = date('now', '+8 hours')";  // 中国时区当天
 const DATE_FILTER_7D = "timestamp >= datetime('now', '-7 days')";                  // 7天内
 const DATE_FILTER_30D = "timestamp >= datetime('now', '-30 days')";                 // 30天内
+const MAX_DNS_RECORDS = 20;
+const MAX_REWRITE_BODY_BYTES = 5 * 1024 * 1024;
+const MAX_REPLAY_BODY_BYTES = 8 * 1024 * 1024;
+const MAX_REMOTE_IP_LIST_BYTES = 512 * 1024;
 
 // 统一时间格式化（北京时间，固定格式）
 function fmtTime(ts) {
@@ -250,6 +254,10 @@ async function queryTrafficByPrefixes(env, routes, startISO, endISO, batchSize =
             });
 
             const cfData = await cfRes.json();
+            if (cfData.errors && cfData.errors.length > 0) {
+                console.error(formatCloudflareApiError(cfData.errors, cfRes.status, '查询 Cloudflare GraphQL 流量'));
+                continue;
+            }
             const groups = cfData?.data?.viewer?.zones?.[0]?.httpRequestsAdaptiveGroups || [];
 
             groups.forEach(g => {
@@ -330,6 +338,272 @@ function validateRouteInput(data, options = {}) {
         ok: true,
         route: { oldPrefix, prefix, target: targets.join(','), mode, remark, icon, cache_img, sort_order, last_play }
     };
+}
+
+function isValidIpv4(value) {
+    if (typeof value !== 'string') return false;
+    const parts = value.split('.');
+    return parts.length === 4 && parts.every(part => /^(?:0|[1-9]\d{0,2})$/.test(part) && Number(part) <= 255);
+}
+
+function isPrivateIpv4(value) {
+    if (!isValidIpv4(value)) return true;
+    const parts = value.split('.').map(Number);
+    return parts[0] === 10
+        || parts[0] === 127
+        || (parts[0] === 169 && parts[1] === 254)
+        || (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31)
+        || (parts[0] === 192 && parts[1] === 168)
+        || parts[0] === 0
+        || parts[0] >= 224;
+}
+
+function isValidIpv6(value) {
+    if (typeof value !== 'string') return false;
+    const raw = value.replace(/^\[|\]$/g, '');
+    if (!raw.includes(':')) return false;
+    try {
+        const parsed = new URL(`http://[${raw}]/`);
+        return parsed.hostname.length > 2;
+    } catch(e) {
+        return false;
+    }
+}
+
+function isPrivateIpv6(value) {
+    const raw = String(value || '').replace(/^\[|\]$/g, '').toLowerCase();
+    return raw === '::1' || raw.startsWith('fc') || raw.startsWith('fd') || raw.startsWith('fe80:');
+}
+
+function isValidDnsHostname(value) {
+    if (typeof value !== 'string') return false;
+    const hostname = value.trim().replace(/\.$/, '').toLowerCase();
+    if (hostname.length < 4 || hostname.length > 253 || hostname.includes('..')) return false;
+    if (/^https?:\/\//i.test(hostname) || /[/?#\s"'<>`]/.test(hostname)) return false;
+    return hostname.split('.').every(label => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i.test(label))
+        && /[a-z]/i.test(hostname.split('.').at(-1) || '');
+}
+
+function normalizeDnsRecordInput(value) {
+    const raw = String(value ?? '').trim();
+    if (!raw) return null;
+    const clean = raw.replace(/^\[|\]$/g, '').replace(/\.$/, '');
+
+    if (isValidIpv4(clean) && !isPrivateIpv4(clean)) {
+        return { type: 'A', content: clean };
+    }
+    if (isValidIpv6(clean) && !isPrivateIpv6(clean)) {
+        return { type: 'AAAA', content: clean };
+    }
+    if (isValidDnsHostname(clean)) {
+        return { type: 'CNAME', content: clean.toLowerCase() };
+    }
+    return null;
+}
+
+function validateDnsRecordInputs(values) {
+    if (!Array.isArray(values)) {
+        return { ok: false, error: 'DNS 记录必须以数组形式提交' };
+    }
+    if (values.length === 0) {
+        return { ok: false, error: '至少需要 1 条 DNS 记录' };
+    }
+    if (values.length > MAX_DNS_RECORDS) {
+        return { ok: false, error: `一次最多允许提交 ${MAX_DNS_RECORDS} 条 DNS 记录` };
+    }
+
+    const deduped = new Map();
+    for (const value of values) {
+        const normalized = normalizeDnsRecordInput(value);
+        if (!normalized) {
+            return { ok: false, error: `DNS 记录格式无效: ${String(value ?? '').slice(0, 80)}` };
+        }
+        deduped.set(`${normalized.type}:${normalized.content}`, normalized);
+    }
+
+    const records = Array.from(deduped.values());
+    const hasCname = records.some(record => record.type === 'CNAME');
+    if (hasCname && records.length > 1) {
+        return { ok: false, error: 'CNAME 记录不能与 A/AAAA 记录同时存在，也不能设置多条' };
+    }
+    return { ok: true, records };
+}
+
+function sanitizeExternalDnsItems(values, limit = 15) {
+    const seen = new Set();
+    const result = [];
+    for (const value of values || []) {
+        const normalized = normalizeDnsRecordInput(value);
+        if (!normalized) continue;
+        const display = normalized.type === 'AAAA' ? `[${normalized.content}]` : normalized.content;
+        if (seen.has(display)) continue;
+        seen.add(display);
+        result.push(display);
+        if (result.length >= limit) break;
+    }
+    return result;
+}
+
+async function readStreamTextWithinLimit(stream, maxBytes) {
+    if (!stream) return '';
+    const reader = stream.getReader();
+    const decoder = new TextDecoder();
+    let bytes = 0;
+    let text = '';
+    while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        bytes += value.byteLength;
+        if (bytes > maxBytes) {
+            throw new Error(`响应体超过 ${Math.round(maxBytes / 1024 / 1024)}MB，跳过重写以保护 Worker 内存`);
+        }
+        text += decoder.decode(value, { stream: true });
+    }
+    text += decoder.decode();
+    return text;
+}
+
+async function readResponseTextWithinLimit(response, maxBytes = MAX_REWRITE_BODY_BYTES) {
+    const length = Number(response.headers.get('content-length') || 0);
+    if (length > maxBytes) {
+        throw new Error(`响应体超过 ${Math.round(maxBytes / 1024 / 1024)}MB，跳过重写以保护 Worker 内存`);
+    }
+    return readStreamTextWithinLimit(response.body, maxBytes);
+}
+
+async function readRequestArrayBufferWithinLimit(request, maxBytes = MAX_REPLAY_BODY_BYTES) {
+    const length = Number(request.headers.get('content-length') || 0);
+    if (length > maxBytes) {
+        throw new Error(`请求体超过 ${Math.round(maxBytes / 1024 / 1024)}MB，无法安全重试`);
+    }
+    const reader = request.body?.getReader();
+    if (!reader) return new ArrayBuffer(0);
+    const chunks = [];
+    let bytes = 0;
+    while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        bytes += value.byteLength;
+        if (bytes > maxBytes) {
+            throw new Error(`请求体超过 ${Math.round(maxBytes / 1024 / 1024)}MB，无法安全重试`);
+        }
+        chunks.push(value);
+    }
+    const result = new Uint8Array(bytes);
+    let offset = 0;
+    for (const chunk of chunks) {
+        result.set(chunk, offset);
+        offset += chunk.byteLength;
+    }
+    return result.buffer;
+}
+
+const CLOUDFLARE_API_ERROR_TIPS = {
+    10000: 'Cloudflare API Token 认证失败。',
+    10001: 'Cloudflare API 请求认证信息无效。请重新生成 CF_API_TOKEN，并确认使用 Bearer Token 方式授权。',
+    9103: 'Cloudflare API Token 权限不足或账号不匹配。',
+    9109: 'Cloudflare API Token 无效。请重新复制或重新创建 CF_API_TOKEN。',
+    7000: 'Cloudflare API 路径无法识别。',
+    7003: 'Cloudflare 资源 ID 无效。',
+    8000000: 'Cloudflare 请求参数无效。'
+};
+
+function getCloudflareActionContext(action = '') {
+    const text = String(action).toLowerCase();
+    if (/dns/.test(text)) {
+        return {
+            permission: 'Zone - DNS - Edit/Write',
+            resource: 'CF_ZONE_ID、CF_DOMAIN 和 DNS 记录是否属于同一个 Zone',
+            params: 'DNS 记录类型、记录值、域名和 TTL 是否有效'
+        };
+    }
+    if (/缓存|cache|purge/.test(text)) {
+        return {
+            permission: 'Zone - Cache Purge',
+            resource: 'CF_ZONE_ID 是否为当前域名所在 Zone',
+            params: '清理缓存请求是否作用在正确的 Zone 上'
+        };
+    }
+    if (/analytics|graphql|流量/.test(text)) {
+        return {
+            permission: 'Zone - Analytics - Read，或账号侧 Account Analytics - Read',
+            resource: 'CF_ZONE_ID 是否为当前域名所在 Zone',
+            params: 'GraphQL 查询条件、时间范围和 Zone ID 是否有效'
+        };
+    }
+    if (/worker|部署|代码|绑定|配置|放置/.test(text)) {
+        return {
+            permission: 'Account - Workers Scripts - Edit/Write（读取配置至少需要 Read，在线更新最终部署需要 Edit/Write）',
+            resource: 'CF_ACCOUNT_ID、CF_WORKER_NAME 是否属于同一个 Cloudflare 账号',
+            params: 'Worker 名称、兼容日期、绑定配置和上传代码是否有效'
+        };
+    }
+    return {
+        permission: '当前操作所需的 Cloudflare API Token 权限',
+        resource: 'CF_ACCOUNT_ID、CF_ZONE_ID、CF_WORKER_NAME 等资源 ID 是否匹配',
+        params: '请求参数是否符合 Cloudflare API 要求'
+    };
+}
+
+function getCloudflareApiErrorTip(error, status = 0, action = '') {
+    const code = Number(error?.code || 0);
+    const message = String(error?.message || '').toLowerCase();
+    const context = getCloudflareActionContext(action);
+
+    if (code === 10000) {
+        return `${CLOUDFLARE_API_ERROR_TIPS[code]} 请检查 CF_API_TOKEN 是否为 API Token（不是 Global API Key），是否复制完整且没有空格/引号，Token 是否过期或被删除；同时确认 Token 属于当前资源所在账号，并具备 ${context.permission} 权限。`;
+    }
+    if (code === 9103) {
+        return `${CLOUDFLARE_API_ERROR_TIPS[code]} 请确认 Token 属于当前资源所在账号，并具备 ${context.permission} 权限。`;
+    }
+    if (code === 9109) {
+        return `${CLOUDFLARE_API_ERROR_TIPS[code]} 重新生成后只粘贴 Token 本体，不要带引号、空格或换行。`;
+    }
+    if (code === 7000 || code === 7003) {
+        return `${CLOUDFLARE_API_ERROR_TIPS[code]} 请确认 ${context.resource}。`;
+    }
+    if (code === 8000000) {
+        return `${CLOUDFLARE_API_ERROR_TIPS[code]} 请检查 ${context.params}；如果是在线更新，确认代码语法正确，且 KV/D1/R2 等绑定没有被删除或改名。`;
+    }
+    if (CLOUDFLARE_API_ERROR_TIPS[code]) return CLOUDFLARE_API_ERROR_TIPS[code];
+    if (status === 401 || /authentication|authenticate|invalid token|access token/.test(message)) {
+        return `Cloudflare 认证失败。请检查 CF_API_TOKEN 是否正确、是否过期，是否误用了 Global API Key，并确认 Token 具备 ${context.permission} 权限。`;
+    }
+    if (status === 403 || /permission|forbidden|not authorized|unauthorized|scope/.test(message)) {
+        return `Cloudflare 权限不足。请确认 API Token 已授予 ${context.permission} 权限，并且 Token 与当前资源所在账号匹配。`;
+    }
+    if (status === 404 || /not found|could not route|no route|does not exist|identifier/.test(message)) {
+        return `Cloudflare 找不到目标资源。请确认 ${context.resource}。`;
+    }
+    if (status === 429 || /rate limit|too many requests/.test(message)) {
+        return 'Cloudflare API 请求过于频繁。请不要连续点击更新/保存，等待 1-5 分钟后再试；如果多人共用同一个 Token，也要降低调用频率。';
+    }
+    if (status >= 500 || /internal error|temporarily unavailable|service unavailable/.test(message)) {
+        return 'Cloudflare 服务端暂时异常。请稍后重试，或到 Cloudflare 状态页确认服务状态；这类失败通常不会自动改动当前 Worker 代码。';
+    }
+    if (/validation|invalid|malformed|bad request/.test(message)) {
+        return `Cloudflare 拒绝了请求参数。请检查 ${context.params}。`;
+    }
+    return 'Cloudflare API 返回了未识别错误。请根据原始错误代码和消息检查 Token、账号 ID、Worker 名称与权限。';
+}
+
+function formatCloudflareApiError(errors, status = 0, action = 'Cloudflare 操作') {
+    const list = Array.isArray(errors) ? errors : [errors].filter(Boolean);
+    if (list.length === 0) {
+        return `${action}失败：Cloudflare API 没有返回具体错误。`;
+    }
+
+    const lines = [`${action}失败：`];
+    const tips = new Set();
+    list.forEach((error, index) => {
+        const code = error?.code ?? 'unknown';
+        const message = error?.message || JSON.stringify(error);
+        lines.push(`${index + 1}. [${code}] ${message}`);
+        tips.add(getCloudflareApiErrorTip(error, status, action));
+    });
+    lines.push('', '排查建议：');
+    tips.forEach(tip => lines.push(`- ${tip}`));
+    return lines.join('\n');
 }
 
 // ==========================================
@@ -1563,7 +1837,7 @@ const LOGIN_UI = `
         function login() {
             const token = document.getElementById('tokenInput').value.trim();
             if(!token) return showToast('请输入正确的密钥');
-            document.cookie = 'admin_token=' + encodeURIComponent(token) + '; path=/; max-age=2592000;';
+            document.cookie = 'admin_token=' + encodeURIComponent(token) + '; path=/; max-age=2592000; Secure; SameSite=Strict';
             window.location.reload();
         }
     </script>
@@ -2327,7 +2601,7 @@ const HTML_UI = `
         function setCustomIconLibrary() {
             const url = document.getElementById('customIconUrlInput').value.trim();
             if (!url) return showToast('⚠️ 请输入图标库 JSON 链接');
-            if (!url.startsWith('http')) return showToast('⚠️ 请输入合法的 URL');
+            if (!isSafeHttpUrl(url)) return showToast('⚠️ 请输入合法的 HTTP/HTTPS URL');
             localStorage.setItem('custom_icon_url', url);
             showToast('⏳ 正在加载自定义图标库...');
             loadIcons(url);
@@ -2346,10 +2620,11 @@ const HTML_UI = `
             const filtered = globalIcons.filter(item => (item.name || '').toLowerCase().includes(lowerFilter));
             let html = \`<div class="icon-item" onclick="selectIcon('', '默认 🎬')" title="使用默认图标"><span style="font-size:22px;">🎬</span></div>\`;
             filtered.forEach(item => {
-                const safeUrl = (item.url || '').replace(/'/g, '&#39;');
-                const safeName = (item.name || '').replace(/'/g, '&#39;');
-                html += \`<div class="icon-item" onclick="selectIcon('\${safeUrl}', '\${safeName}')" title="\${safeName}">
-                            <img src="\${safeUrl}" loading="lazy" style="width: 32px; height: 32px; object-fit: contain; border-radius: 4px;">
+                const rawUrl = String(item.url || '');
+                if (!isSafeHttpUrl(rawUrl)) return;
+                const rawName = String(item.name || '未命名图标');
+                html += \`<div class="icon-item" onclick="selectIcon(\${jsStringAttr(rawUrl)}, \${jsStringAttr(rawName)})" title="\${escapeAttr(rawName)}">
+                            <img src="\${escapeAttr(rawUrl)}" loading="lazy" style="width: 32px; height: 32px; object-fit: contain; border-radius: 4px;">
                         </div>\`;
             });
             grid.innerHTML = html;
@@ -2762,7 +3037,7 @@ const HTML_UI = `
                 });
 
             } catch (err) {
-                document.getElementById('list-grid').innerHTML = \`<div style="text-align:center; color:#ff3b30; font-weight:600; grid-column: 1 / -1; padding: 20px;">⚠️ 读取失败: \${err.message}</div>\`;
+                document.getElementById('list-grid').innerHTML = \`<div style="text-align:center; color:#ff3b30; font-weight:600; grid-column: 1 / -1; padding: 20px;">⚠️ 读取失败: \${escapeHtml(err.message)}</div>\`;
             }
         }
 
@@ -2914,15 +3189,17 @@ const HTML_UI = `
             showToast(\`✅ 提取到 \${extractedIps.length} 个节点，开始测速校验\`);
             const promises = [];
             extractedIps.forEach(ip => {
+                const safeIpText = escapeHtml(ip);
+                const safeIpAttr = escapeAttr(ip);
                 const tr = document.createElement('tr');
                 tr.className = 'test-row';
                 tr.innerHTML = \`
-                    <td data-label="勾选节点" style="text-align: center;"><input type="checkbox" class="ip-checkbox row-checkbox" value="\${ip}"></td>
-                    <td data-label="专属节点"><strong class="ip-text" style="color:var(--primary);cursor:pointer;font-family:monospace;" onclick="copyTxt('\${ip}')" title="点击复制">\${ip}</strong></td>
+                    <td data-label="勾选节点" style="text-align: center;"><input type="checkbox" class="ip-checkbox row-checkbox" value="\${safeIpAttr}"></td>
+                    <td data-label="专属节点"><strong class="ip-text" style="color:var(--primary);cursor:pointer;font-family:monospace;" onclick="copyTxt(\${jsStringAttr(ip)})" title="点击复制">\${safeIpText}</strong></td>
                     <td data-label="预估延迟" class="latency" data-ms="9999" style="font-weight: 600; color: #888;">测算中...</td>
                     <td data-label="连通状态" class="speed" style="color: #888;">-</td>
                     <td data-label="记录/归属地" class="loc" style="color: #666;">等待解析</td>
-                    <td data-label="快捷操作"><button class="btn-dns" disabled onclick="updateSingleDns('\${ip}', this)">唯一解析</button></td>\`;
+                    <td data-label="快捷操作"><button class="btn-dns" disabled onclick="updateSingleDns(\${jsStringAttr(ip)}, this)">唯一解析</button></td>\`;
                 tbody.insertBefore(tr, tbody.firstChild);
                 promises.push(doLocalPing(ip, tr, '自定义节点'));
             });
@@ -2949,15 +3226,17 @@ const HTML_UI = `
                 btn.textContent = '⚡ 测速中...';
                 const promises = [];
                 data.ips.forEach(ip => {
+                    const safeIpText = escapeHtml(ip);
+                    const safeIpAttr = escapeAttr(ip);
                     const tr = document.createElement('tr');
                     tr.className = 'test-row';
                     tr.innerHTML = \`
-                        <td data-label="勾选节点" style="text-align: center;"><input type="checkbox" class="ip-checkbox row-checkbox" value="\${ip}"></td>
-                        <td data-label="专属节点"><strong class="ip-text" style="color:var(--primary);cursor:pointer;font-family:monospace;" onclick="copyTxt('\${ip}')" title="点击复制">\${ip}</strong></td>
+                        <td data-label="勾选节点" style="text-align: center;"><input type="checkbox" class="ip-checkbox row-checkbox" value="\${safeIpAttr}"></td>
+                        <td data-label="专属节点"><strong class="ip-text" style="color:var(--primary);cursor:pointer;font-family:monospace;" onclick="copyTxt(\${jsStringAttr(ip)})" title="点击复制">\${safeIpText}</strong></td>
                         <td data-label="预估延迟" class="latency" data-ms="9999" style="font-weight: 600; color: #888;">测算中...</td>
                         <td data-label="连通状态" class="speed" style="color: #888;">-</td>
                         <td data-label="记录/归属地" class="loc" style="color: #666;">等待解析</td>
-                        <td data-label="快捷操作"><button class="btn-dns" disabled onclick="updateSingleDns('\${ip}', this)">唯一解析</button></td>\`;
+                        <td data-label="快捷操作"><button class="btn-dns" disabled onclick="updateSingleDns(\${jsStringAttr(ip)}, this)">唯一解析</button></td>\`;
                     tbody.insertBefore(tr, tbody.firstChild);
                     promises.push(doLocalPing(ip, tr, '自定义 API'));
                 });
@@ -2987,15 +3266,17 @@ const HTML_UI = `
                 btn.textContent = '⚡ 本地测速中...';
                 const promises = [];
                 data.ips.forEach(ip => {
+                    const safeIpText = escapeHtml(ip);
+                    const safeIpAttr = escapeAttr(ip);
                     const tr = document.createElement('tr');
                     tr.className = 'test-row';
                     tr.innerHTML = \`
-                        <td data-label="勾选节点" style="text-align: center;"><input type="checkbox" class="ip-checkbox row-checkbox" value="\${ip}"></td>
-                        <td data-label="专属节点"><strong class="ip-text" style="color:var(--primary);cursor:pointer;font-family:monospace;" onclick="copyTxt('\${ip}')" title="点击复制">\${ip}</strong></td>
+                        <td data-label="勾选节点" style="text-align: center;"><input type="checkbox" class="ip-checkbox row-checkbox" value="\${safeIpAttr}"></td>
+                        <td data-label="专属节点"><strong class="ip-text" style="color:var(--primary);cursor:pointer;font-family:monospace;" onclick="copyTxt(\${jsStringAttr(ip)})" title="点击复制">\${safeIpText}</strong></td>
                         <td data-label="预估延迟" class="latency" data-ms="9999" style="font-weight: 600; color: #888;">测算中...</td>
                         <td data-label="连通状态" class="speed" style="color: #888;">-</td>
                         <td data-label="记录/归属地" class="loc" style="color: #666;">等待解析</td>
-                        <td data-label="快捷操作"><button class="btn-dns" disabled onclick="updateSingleDns('\${ip}', this)">唯一解析</button></td>\`;
+                        <td data-label="快捷操作"><button class="btn-dns" disabled onclick="updateSingleDns(\${jsStringAttr(ip)}, this)">唯一解析</button></td>\`;
                     tbody.insertBefore(tr, tbody.firstChild);
                     promises.push(doLocalPing(ip, tr, typeText.replace(/[^\u4e00-\u9fa5a-zA-Z0-9]/g, '')));
                 });
@@ -3026,10 +3307,11 @@ const HTML_UI = `
             const queryIp = ip.replace(/[\\[\\]]/g, '');
             const isIPv6 = ip.includes(':'); 
             const isDomain = /[a-zA-Z]/.test(queryIp) && !isIPv6;
-            if (isDomain) { locTd.innerHTML = \`<span class="badge" style="background:rgba(175,82,222,0.1);color:#af52de;margin-right:4px;">CNAME</span> \${sourceLabel} | 优选域名\`;
+            const safeSourceLabel = escapeHtml(sourceLabel);
+            if (isDomain) { locTd.innerHTML = \`<span class="badge" style="background:rgba(175,82,222,0.1);color:#af52de;margin-right:4px;">CNAME</span> \${safeSourceLabel} | 优选域名\`;
             } else {
                 const recordLabel = isIPv6 ? '<span class="badge" style="background:rgba(50,173,230,0.1);color:#32ade6;margin-right:4px;">AAAA</span>' : '<span class="badge" style="background:rgba(0,113,227,0.1);color:#0071e3;margin-right:4px;">A记录</span>';
-                fetch(\`https://api.ip.sb/geoip/\${queryIp}\`).then(res => res.json()).then(data => locTd.innerHTML = \`\${recordLabel} \${sourceLabel} | \${data.country || '未知'}\`).catch(() => locTd.innerHTML = \`\${recordLabel} \${sourceLabel} | 解析失败\`);
+                fetch(\`https://api.ip.sb/geoip/\${encodeURIComponent(queryIp)}\`).then(res => res.json()).then(data => locTd.innerHTML = \`\${recordLabel} \${safeSourceLabel} | \${escapeHtml(data.country || '未知')}\`).catch(() => locTd.innerHTML = \`\${recordLabel} \${safeSourceLabel} | 解析失败\`);
             }
             const start = performance.now();
             const controller = new AbortController();
@@ -3103,8 +3385,8 @@ const HTML_UI = `
                 if (data.success && data.result) {
                     const records = data.result.filter(r => r.type === 'A' || r.type === 'AAAA' || r.type === 'CNAME');
                     if (records.length === 0) container.innerHTML = '<span class="badge" style="background:rgba(255,149,0,0.1);color:#ff9500;">暂无解析记录</span>';
-                    else container.innerHTML = records.map(r => \`<span class="badge" style="background:rgba(0,113,227,0.1);color:var(--primary);border:1px solid rgba(0,113,227,0.2);">\${r.type} | \${r.content}</span>\`).join('');
-                } else container.innerHTML = \`<span class="badge" style="background:rgba(255,59,48,0.1);color:#ff3b30;">\${data.error || '获取失败'}</span>\`;
+                    else container.innerHTML = records.map(r => \`<span class="badge" style="background:rgba(0,113,227,0.1);color:var(--primary);border:1px solid rgba(0,113,227,0.2);">\${escapeHtml(r.type)} | \${escapeHtml(r.content)}</span>\`).join('');
+                } else container.innerHTML = \`<span class="badge" style="background:rgba(255,59,48,0.1);color:#ff3b30;">\${escapeHtml(data.error || '获取失败')}</span>\`;
             } catch (e) { document.getElementById('dnsStatus').innerHTML = '<span class="badge" style="background:rgba(255,59,48,0.1);color:#ff3b30;">网络异常</span>'; }
         }
         
@@ -3432,7 +3714,7 @@ const HTML_UI = `
                     alert('🎉 成功！' + data.msg + '\\n\\n点击确定后页面将自动刷新。');
                     window.location.reload(); 
                 } else {
-                    alert('❌ 部署失败：\\n' + JSON.stringify(data.error));
+                    alert('❌ 部署失败：\\n' + (data.error || '未知错误'));
                 }
             } catch (e) {
                 alert('🚨 异常：\\n' + e.message);
@@ -3516,7 +3798,7 @@ const HTML_UI = `
                     alert('🎉 在线更新成功！\\n\\n点击确定后页面将自动刷新，畅享新版本！');
                     window.location.reload(); 
                 } else {
-                    alert('❌ 更新失败：\\n' + JSON.stringify(data.error));
+                    alert('❌ 更新失败：\\n' + (data.error || '未知错误'));
                 }
             } catch (e) {
                 alert('🚨 异常：\\n' + e.message);
@@ -3612,7 +3894,7 @@ async function getCFTraffic(env, type) {
         const cfData = await cfRes.json();
         
         if (cfData.errors && cfData.errors.length > 0) {
-            return `API报错: ${cfData.errors[0].message}`;
+            return formatCloudflareApiError(cfData.errors, cfRes.status, '查询 Cloudflare Analytics');
         }
         
         const zones = cfData?.data?.viewer?.zones;
@@ -4064,7 +4346,7 @@ export default {
                 if (cfData.success) {
                     return new Response(JSON.stringify({ success: true, msg: '部署区域修改成功！' }), { headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }});
                 } else {
-                    return new Response(JSON.stringify({ success: false, msg: 'CF报错: ' + (cfData.errors[0]?.message || '未知错误') }), { headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }});
+                    return new Response(JSON.stringify({ success: false, msg: formatCloudflareApiError(cfData.errors, cfRes.status, '修改 Worker 放置地区') }), { headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }});
                 }
             } catch(e) {
                 return new Response(JSON.stringify({ success: false, msg: e.message }), { headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }});
@@ -4326,6 +4608,9 @@ export default {
                     headers: { 'Authorization': `Bearer ${cfToken}` }
                 });
                 const serviceData = await serviceRes.json();
+                if (!serviceData.success) {
+                    throw new Error(formatCloudflareApiError(serviceData.errors, serviceRes.status, '读取 Worker 配置'));
+                }
                 
                 let compDate = "2024-01-01"; // 依然保留兜底，但这次绝不会用到
                 let compFlags = undefined;
@@ -4360,7 +4645,10 @@ export default {
                     headers: { 'Authorization': `Bearer ${cfToken}` }
                 });
                 const bindingsData = await bindingsRes.json();
-                if (bindingsData.success && Array.isArray(bindingsData.result)) {
+                if (!bindingsData.success) {
+                    throw new Error(formatCloudflareApiError(bindingsData.errors, bindingsRes.status, '读取 Worker 绑定'));
+                }
+                if (Array.isArray(bindingsData.result)) {
                     for (const b of bindingsData.result) {
                         if (b.type !== 'plain_text' && b.type !== 'secret_text' && b.type !== 'inherited') {
                             preservedBindings.push(b);
@@ -4391,7 +4679,7 @@ export default {
                 if (data.success) {
                     return Response.json({ success: true, msg: '代码更新成功，并已完美保留原有放置地区和兼容配置！' });
                 } else {
-                    throw new Error(JSON.stringify(data.errors));
+                    throw new Error(formatCloudflareApiError(data.errors, res.status, '部署 Worker 代码'));
                 }
             } catch (e) {
                 return Response.json({ success: false, error: e.message });
@@ -4406,7 +4694,7 @@ export default {
             try {
                 const res = await fetch(`https://api.cloudflare.com/client/v4/zones/${zoneId}/purge_cache`, { method: 'POST', headers: { 'Authorization': `Bearer ${cfToken}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ purge_everything: true }) });
                 const data = await res.json();
-                if (!data.success) throw new Error(JSON.stringify(data.errors));
+                if (!data.success) throw new Error(formatCloudflareApiError(data.errors, res.status, '清理 Cloudflare 缓存'));
                 return Response.json({ success: true });
             } catch (e) { return Response.json({ success: false, error: e.message }); }
         }
@@ -4428,6 +4716,7 @@ export default {
             try {
                 const getRes = await fetch(`https://api.cloudflare.com/client/v4/zones/${zoneId}/dns_records?name=${domain}`, { headers: { 'Authorization': `Bearer ${cfToken}` } });
                 const getData = await getRes.json();
+                if (!getData.success) throw new Error(formatCloudflareApiError(getData.errors, getRes.status, '读取 DNS 记录'));
                 return Response.json({ success: true, result: getData.result });
             } catch (error) { return Response.json({ success: false, error: error.message }); }
         }
@@ -4438,22 +4727,48 @@ export default {
 
             if (!cfToken || !zoneId || !domain) return Response.json({ success: false, error: '缺少 DNS 环境变量' });
             try {
+                const validated = validateDnsRecordInputs(ips);
+                if (!validated.ok) return Response.json({ success: false, error: validated.error }, { status: 400 });
+
                 const getRes = await fetch(`https://api.cloudflare.com/client/v4/zones/${zoneId}/dns_records?name=${domain}`, { headers: { 'Authorization': `Bearer ${cfToken}` } });
                 const getData = await getRes.json();
-                if (!getData.success) throw new Error('获取现有 DNS 记录失败');
+                if (!getData.success) throw new Error(formatCloudflareApiError(getData.errors, getRes.status, '获取现有 DNS 记录'));
 
                 const oldRecords = getData.result.filter(r => r.type === 'A' || r.type === 'AAAA' || r.type === 'CNAME');
+                const rollbackRecords = oldRecords.map(record => ({
+                    type: record.type,
+                    name: record.name,
+                    content: record.content,
+                    ttl: record.ttl || 60,
+                    proxied: record.proxied === true
+                }));
+                let deletedOldRecords = false;
+                const rollback = async () => {
+                    if (!deletedOldRecords || rollbackRecords.length === 0) return;
+                    await Promise.allSettled(rollbackRecords.map(record => fetch(`https://api.cloudflare.com/client/v4/zones/${zoneId}/dns_records`, {
+                        method: 'POST',
+                        headers: { 'Authorization': `Bearer ${cfToken}`, 'Content-Type': 'application/json' },
+                        body: JSON.stringify(record)
+                    })));
+                };
+
                 for (const record of oldRecords) {
-                    await fetch(`https://api.cloudflare.com/client/v4/zones/${zoneId}/dns_records/${record.id}`, { method: 'DELETE', headers: { 'Authorization': `Bearer ${cfToken}` } });
+                    const deleteRes = await fetch(`https://api.cloudflare.com/client/v4/zones/${zoneId}/dns_records/${record.id}`, { method: 'DELETE', headers: { 'Authorization': `Bearer ${cfToken}` } });
+                    const deleteData = await deleteRes.json();
+                    if (!deleteData.success) {
+                        await rollback();
+                        throw new Error(formatCloudflareApiError(deleteData.errors, deleteRes.status, `删除 DNS 记录 ${record.name}`));
+                    }
+                    deletedOldRecords = true;
                 }
 
-                for (const ip of ips) {
-                    const cleanItem = ip.replace(/[\[\]]/g, ''); let recordType = 'A';
-                    if (cleanItem.includes(':')) recordType = 'AAAA'; else if (/[a-zA-Z]/.test(cleanItem)) recordType = 'CNAME';
-
-                    const postRes = await fetch(`https://api.cloudflare.com/client/v4/zones/${zoneId}/dns_records`, { method: 'POST', headers: { 'Authorization': `Bearer ${cfToken}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ type: recordType, name: domain, content: cleanItem, ttl: 60, proxied: false }) });
+                for (const record of validated.records) {
+                    const postRes = await fetch(`https://api.cloudflare.com/client/v4/zones/${zoneId}/dns_records`, { method: 'POST', headers: { 'Authorization': `Bearer ${cfToken}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ type: record.type, name: domain, content: record.content, ttl: 60, proxied: false }) });
                     const postData = await postRes.json();
-                    if(!postData.success) throw new Error(`记录提交失败: ` + JSON.stringify(postData.errors));
+                    if(!postData.success) {
+                        await rollback();
+                        throw new Error(formatCloudflareApiError(postData.errors, postRes.status, `提交 DNS 记录 ${record.content}`));
+                    }
                 }
                 return Response.json({ success: true, message: `✅ 成功！` });
             } catch (error) { return Response.json({ success: false, error: error.message }); }
@@ -4463,27 +4778,30 @@ export default {
             try {
                 const apiUrl = url.searchParams.get('url');
                 if (!apiUrl) throw new Error("缺少 URL");
+                const parsedApiUrl = new URL(apiUrl);
+                if (parsedApiUrl.protocol !== 'http:' && parsedApiUrl.protocol !== 'https:') {
+                    throw new Error("自定义 API 仅支持 HTTP/HTTPS URL");
+                }
                 const response = await fetch(apiUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } });
-                const text = await response.text(); let validIPs = new Set();
+                const text = await readResponseTextWithinLimit(response, MAX_REMOTE_IP_LIST_BYTES);
+                let collectedItems = [];
                 try {
                     const jsonObj = JSON.parse(text);
                     if (jsonObj && jsonObj.data && Array.isArray(jsonObj.data)) {
-                        jsonObj.data.forEach(item => { if (item.ip) { let ip = item.ip; if (ip.includes(':') && !ip.startsWith('[')) ip = `[${ip}]`; validIPs.add(ip); } });
+                        jsonObj.data.forEach(item => { if (item.ip) collectedItems.push(item.ip); });
                     }
                 } catch (e) {}
 
-                if (validIPs.size === 0) {
+                if (collectedItems.length === 0) {
                     const ipv4Regex = /\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b/g;
-                    const matchedIPv4 = text.match(ipv4Regex) || [];
-                    matchedIPv4.forEach(ip => { if (!ip.startsWith('10.') && !ip.startsWith('192.168.') && !ip.startsWith('127.')) validIPs.add(ip); });
+                    collectedItems.push(...(text.match(ipv4Regex) || []));
 
                     const ipv6Regex = /(?:[A-F0-9]{1,4}:){7}[A-F0-9]{1,4}|(?:[A-F0-9]{1,4}:)*:[A-F0-9]{1,4}(?::[A-F0-9]{1,4})*/gi;
-                    const matchedIPv6 = text.match(ipv6Regex) || [];
-                    matchedIPv6.forEach(ip => { if (ip.length > 7 && ip.includes(':') && !ip.startsWith('::1')) validIPs.add(ip.startsWith('[') ? ip : `[${ip}]`); });
+                    collectedItems.push(...(text.match(ipv6Regex) || []));
                 }
-                const uniqueIPArray = Array.from(validIPs);
+                const uniqueIPArray = sanitizeExternalDnsItems(collectedItems, 15);
                 for (let i = uniqueIPArray.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [uniqueIPArray[i], uniqueIPArray[j]] = [uniqueIPArray[j], uniqueIPArray[i]]; }
-                return Response.json({ success: true, ips: uniqueIPArray.slice(0, 15), totalCount: uniqueIPArray.length });
+                return Response.json({ success: true, ips: uniqueIPArray, totalCount: uniqueIPArray.length });
             } catch (error) { return Response.json({ success: false, error: error.message }, { status: 500 }); }
         }
 
@@ -4496,12 +4814,11 @@ export default {
                     try {
                         const res1 = await fetch('https://api.uouin.com/cloudflare.html', { headers: { 'User-Agent': 'Mozilla/5.0' } });
                         if(res1.ok) {
-                            const text1 = await res1.text(); const cleanText = text1.replace(/<[^>]+>/g, ' ');
+                            const text1 = await readResponseTextWithinLimit(res1, MAX_REMOTE_IP_LIST_BYTES); const cleanText = text1.replace(/<[^>]+>/g, ' ');
                             const regex = /(电信|联通|移动|多线|ipv6)\s+((?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)|(?:[a-fA-F0-9]{1,4}:)+[a-fA-F0-9]{1,4})/gi;
                             let match; while ((match = regex.exec(cleanText)) !== null) {
                                 const lineType = match[1].toLowerCase(); let ip = match[2];
-                                if (ip.includes(':') && !ip.startsWith('[')) ip = `[${ip}]`;
-                                if (reqType === 'all' || reqType === lineType) validIPs.add(ip);
+                                if (reqType === 'all' || reqType === lineType) sanitizeExternalDnsItems([ip], 1).forEach(item => validIPs.add(item));
                             }
                         }
                     } catch(e) {}
@@ -4511,8 +4828,8 @@ export default {
                     try {
                         const res2 = await fetch('https://raw.githubusercontent.com/ZhiXuanWang/cf-speed-dns/refs/heads/main/ipTop10.html', { headers: { 'User-Agent': 'Mozilla/5.0' } });
                         if(res2.ok) {
-                            const text2 = await res2.text(); const ipv4Regex = /\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b/g;
-                            const matched = text2.match(ipv4Regex) || []; matched.forEach(ip => { if (!ip.startsWith('10.') && !ip.startsWith('192.168.') && !ip.startsWith('127.')) validIPs.add(ip); });
+                            const text2 = await readResponseTextWithinLimit(res2, MAX_REMOTE_IP_LIST_BYTES); const ipv4Regex = /\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b/g;
+                            sanitizeExternalDnsItems(text2.match(ipv4Regex) || [], 50).forEach(ip => validIPs.add(ip));
                         }
                     } catch(e) {}
                 }
@@ -5482,7 +5799,11 @@ export default {
             // 只有在"请求体会被重复使用"时才预读成 ArrayBuffer：
             // 1. 多节点 failover：同一个 POST 可能发往多个 target
             // 2. 同节点候选回退：例如 /Items/... 失败后，再试 /emby/Items/...
-            bodyBuffer = await request.clone().arrayBuffer();
+            try {
+                bodyBuffer = await readRequestArrayBufferWithinLimit(request.clone(), MAX_REPLAY_BODY_BYTES);
+            } catch(e) {
+                return new Response(e.message, { status: 413 });
+            }
         }
 
         let finalResponse = null; let lastError = null; let finalTargetUrl = null;
@@ -5583,7 +5904,7 @@ export default {
         if (!isPassthroughMode && finalResponse.status === 200 && responseHeaders.get("content-type")?.includes("json") && url.pathname.toLowerCase().includes("playbackinfo")) {
             try {
                 let clonedRes = finalResponse.clone();
-                let data = await clonedRes.json();
+                let data = JSON.parse(await readResponseTextWithinLimit(clonedRes, MAX_REWRITE_BODY_BYTES));
                 let modified = false;
                 if (data && data.MediaSources) {
                     data.MediaSources.forEach(source => {
@@ -5629,7 +5950,7 @@ export default {
         if (!isPassthroughMode && finalResponse.status === 200 && responseHeaders.get("content-type")?.includes("json")) {
             try {
                 let clonedRes = finalResponse.clone();
-                let text = await clonedRes.text();
+                let text = await readResponseTextWithinLimit(clonedRes, MAX_REWRITE_BODY_BYTES);
                 if (hasJsonRewriteCandidate(text, targetOrigins)) {
                     let data = JSON.parse(text);
                     let rewritten = rewriteSourceUrlsInJson(data, targetOrigins, proxyOrigin, safePrefix);
@@ -5647,7 +5968,7 @@ export default {
         if (finalResponse.status === 200 && url.pathname.toLowerCase().endsWith('.m3u8')) {
             try {
                 let clonedRes = finalResponse.clone(); 
-                let text = await clonedRes.text();
+                let text = await readResponseTextWithinLimit(clonedRes, MAX_REWRITE_BODY_BYTES);
                 if (text.includes('http://') || text.includes('https://')) {
                     // 🎯 同样修复变量名
                     let modifiedText = text.replace(/(https?:\/\/[^\s]+)/g, proxyOrigin + safePrefix + '/$1');
