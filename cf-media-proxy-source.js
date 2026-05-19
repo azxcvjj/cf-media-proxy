@@ -1,6 +1,6 @@
-// VERSION: 2.1.0.8
+// VERSION: 2.1.1.0
 // 🟢 面板核心配置区 (放在最顶端方便修改)
-const CURRENT_VERSION = "2.1.0.8";
+const CURRENT_VERSION = "2.1.1.0";
 const GITHUB_RAW_URL = "https://raw.githubusercontent.com/azxcvjj/cf-media-proxy/main/cf-media-proxy.js";
 
 // ==========================================
@@ -2345,6 +2345,83 @@ const HTML_UI = `
             return escapeAttr(JSON.stringify(String(value ?? '')));
         }
 
+        const uiCityNameZh = {
+            taizhou: '泰州',
+            nanjing: '南京',
+            beijing: '北京',
+            shanghai: '上海',
+            guangzhou: '广州',
+            shenzhen: '深圳',
+            chengdu: '成都',
+            hangzhou: '杭州',
+            suzhou: '苏州',
+            wuxi: '无锡',
+            changzhou: '常州',
+            nantong: '南通',
+            yangzhou: '扬州',
+            zhenjiang: '镇江',
+            xuzhou: '徐州',
+            yancheng: '盐城',
+            huaian: '淮安',
+            lianyungang: '连云港',
+            suqian: '宿迁',
+            kunshan: '昆山',
+            wuhan: '武汉',
+            xian: '西安',
+            xianyang: '咸阳',
+            zhengzhou: '郑州',
+            changsha: '长沙',
+            chongqing: '重庆',
+            tianjin: '天津',
+            qingdao: '青岛',
+            jinan: '济南',
+            ningbo: '宁波',
+            xiamen: '厦门',
+            fuzhou: '福州',
+            dongguan: '东莞',
+            foshan: '佛山',
+            zhuhai: '珠海'
+        };
+
+        function uiCountryNameZh(code) {
+            const normalized = String(code || '').trim().toUpperCase();
+            const map = {
+                CN: '中国',
+                US: '美国',
+                JP: '日本',
+                KR: '韩国',
+                HK: '中国香港',
+                TW: '中国台湾',
+                SG: '新加坡',
+                DE: '德国',
+                FR: '法国',
+                GB: '英国',
+                AU: '澳大利亚',
+                CA: '加拿大'
+            };
+            return map[normalized] || normalized || '未知';
+        }
+
+        function uiTranslateCityNameZh(city) {
+            const text = String(city || '').trim();
+            if (!text) return '';
+            if (/[\u4e00-\u9fff]/.test(text)) return text;
+            const normalized = text
+                .normalize('NFKC')
+                .toLowerCase()
+                .replace(/['\x60]/g, '')
+                .replace(/[\s-]+/g, '')
+                .replace(/[^a-z]/g, '');
+            return uiCityNameZh[normalized] || text;
+        }
+
+        function formatLogLocation(log) {
+            const countryName = uiCountryNameZh(log.country);
+            const cityName = uiTranslateCityNameZh(log.city);
+            if (cityName) return countryName + '-' + cityName;
+            return countryName;
+        }
+
         function isSafeHttpUrl(value) {
             try {
                 const parsed = new URL(String(value ?? ''));
@@ -2556,11 +2633,12 @@ const HTML_UI = `
                     data.recents.slice(0, 10).forEach(log => {
                         const tr = document.createElement('tr');
                         const isChina = log.country === 'CN';
+                        const locationText = formatLogLocation(log);
                         tr.innerHTML = \`
                             <td data-label="访问时间" style="font-size:12px; white-space:nowrap;">\${escapeHtml(log.timestamp)}</td>
                             <td data-label="目标节点"><span class="badge" style="background:rgba(0,113,227,0.1);color:var(--primary);">\${escapeHtml(log.prefix)}</span></td>
                             <td data-label="真实 IP" style="font-family:monospace; font-size:13px; color:var(--text-sec); word-break:break-all;">\${escapeHtml(log.ip)}</td>
-                            <td data-label="归属地"><span class="badge" style="background:\${isChina ? 'rgba(52,199,89,0.1)' : 'rgba(255,149,0,0.1)'}; color:\${isChina ? '#34c759' : '#ff9500'};">\${escapeHtml(isChina ? '中国大陆' : (log.country || 'Unknown'))}</span></td>
+                            <td data-label="归属地"><span class="badge" style="background:\${isChina ? 'rgba(52,199,89,0.1)' : 'rgba(255,149,0,0.1)'}; color:\${isChina ? '#34c759' : '#ff9500'};">\${escapeHtml(locationText)}</span></td>
                             <td data-label="设备标识 (UA)" style="font-size:12px; color:var(--text-sec); word-break: break-all; white-space: normal; text-align: right; line-height: 1.4;" title="\${escapeAttr(log.ua)}">\${escapeHtml(log.ua)}</td>
                         \`;
                         tbody.appendChild(tr);
@@ -3851,8 +3929,7 @@ const HTML_UI = `
 // 2. 后端 Worker 主逻辑处理区 (核心故障转移 + TG Bot播报 + 智能流量拉取)
 // ==========================================
 
-// getCFTraffic 使用顶部工具区的 formatBytes 函数
-async function getCFTraffic(env, type) {
+async function getCFTrafficBytes(env, type) {
     if (!env.CF_API_TOKEN || !env.CF_ZONE_ID) return "缺少变量";
     try {
         const end = new Date();
@@ -3940,21 +4017,341 @@ async function getCFTraffic(env, type) {
             }
         }
 
-        if (totalBytes === 0) return "0 B";
-        return formatBytes(totalBytes);
-
+        return totalBytes;
     } catch(e) {
         return "请求异常";
+    }
+}
+
+// getCFTraffic 使用顶部工具区的 formatBytes 函数
+async function getCFTraffic(env, type) {
+    const result = await getCFTrafficBytes(env, type);
+    if (typeof result !== 'number') return result;
+    return result === 0 ? '0 B' : formatBytes(result);
+}
+
+function escapeTelegramHtml(value) {
+    return String(value ?? '').replace(/[&<>"']/g, ch => ({
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#39;'
+    }[ch]));
+}
+
+function truncateTelegramText(value, maxLength = 88) {
+    const text = String(value ?? '');
+    if (text.length <= maxLength) return text;
+    return text.slice(0, Math.max(0, maxLength - 1)) + '…';
+}
+
+const TG_COLO_LOCATIONS = {
+    SJC: { country: 'US', city: '圣何塞' },
+    LAX: { country: 'US', city: '洛杉矶' },
+    SFO: { country: 'US', city: '旧金山' },
+    SEA: { country: 'US', city: '西雅图' },
+    DFW: { country: 'US', city: '达拉斯' },
+    ORD: { country: 'US', city: '芝加哥' },
+    IAD: { country: 'US', city: '华盛顿' },
+    JFK: { country: 'US', city: '纽约' },
+    BOS: { country: 'US', city: '波士顿' },
+    MIA: { country: 'US', city: '迈阿密' },
+    NRT: { country: 'JP', city: '东京' },
+    TYO: { country: 'JP', city: '东京' },
+    KIX: { country: 'JP', city: '大阪' },
+    NGO: { country: 'JP', city: '名古屋' },
+    ICN: { country: 'KR', city: '首尔' },
+    SEL: { country: 'KR', city: '首尔' },
+    HKG: { country: 'HK', city: '香港' },
+    TPE: { country: 'TW', city: '台北' },
+    SIN: { country: 'SG', city: '新加坡' },
+    FRA: { country: 'DE', city: '法兰克福' },
+    MUC: { country: 'DE', city: '慕尼黑' },
+    AMS: { country: 'NL', city: '阿姆斯特丹' },
+    CDG: { country: 'FR', city: '巴黎' },
+    PAR: { country: 'FR', city: '巴黎' },
+    LHR: { country: 'GB', city: '伦敦' },
+    MAD: { country: 'ES', city: '马德里' },
+    SYD: { country: 'AU', city: '悉尼' },
+    MEL: { country: 'AU', city: '墨尔本' },
+    AKL: { country: 'NZ', city: '奥克兰' },
+    YYZ: { country: 'CA', city: '多伦多' },
+    YVR: { country: 'CA', city: '温哥华' },
+    YUL: { country: 'CA', city: '蒙特利尔' },
+    PEK: { country: 'CN', city: '北京' },
+    PVG: { country: 'CN', city: '上海' },
+    CAN: { country: 'CN', city: '广州' },
+    SZX: { country: 'CN', city: '深圳' },
+    CTU: { country: 'CN', city: '成都' },
+    NKG: { country: 'CN', city: '南京' }
+};
+
+const TG_CITY_NAME_ZH = {
+    taizhou: '泰州',
+    nanjing: '南京',
+    beijing: '北京',
+    shanghai: '上海',
+    guangzhou: '广州',
+    shenzhen: '深圳',
+    chengdu: '成都',
+    hangzhou: '杭州',
+    suzhou: '苏州',
+    wuxi: '无锡',
+    changzhou: '常州',
+    nantong: '南通',
+    yangzhou: '扬州',
+    zhenjiang: '镇江',
+    xuzhou: '徐州',
+    yancheng: '盐城',
+    huaian: '淮安',
+    lianyungang: '连云港',
+    suqian: '宿迁',
+    kunshan: '昆山',
+    wuhan: '武汉',
+    xian: '西安',
+    xi_an: '西安',
+    zhengzhou: '郑州',
+    changsha: '长沙',
+    chongqing: '重庆',
+    tianjin: '天津',
+    qingdao: '青岛',
+    jinan: '济南',
+    ningbo: '宁波',
+    xiamen: '厦门',
+    fuzhou: '福州',
+    dongguan: '东莞',
+    foshan: '佛山',
+    zhuhai: '珠海',
+    tokyo: '东京',
+    osaka: '大阪',
+    seoul: '首尔',
+    singapore: '新加坡',
+    hongkong: '香港',
+    taipei: '台北',
+    bangkok: '曼谷',
+    kualalumpur: '吉隆坡',
+    dubai: '迪拜',
+    frankfurt: '法兰克福',
+    munich: '慕尼黑',
+    amsterdam: '阿姆斯特丹',
+    paris: '巴黎',
+    london: '伦敦',
+    madrid: '马德里',
+    sydney: '悉尼',
+    melbourne: '墨尔本',
+    auckland: '奥克兰',
+    toronto: '多伦多',
+    vancouver: '温哥华',
+    montreal: '蒙特利尔',
+    newyork: '纽约',
+    washington: '华盛顿',
+    chicago: '芝加哥',
+    dallas: '达拉斯',
+    seattle: '西雅图',
+    losangeles: '洛杉矶',
+    sanfrancisco: '旧金山',
+    sanjose: '圣何塞',
+    boston: '波士顿',
+    miami: '迈阿密'
+};
+
+function getCountryNameZh(countryCode) {
+    const code = String(countryCode || '').trim().toUpperCase();
+    if (!code) return '未知';
+    try {
+        const displayNames = new Intl.DisplayNames(['zh-CN'], { type: 'region' });
+        return displayNames.of(code) || code;
+    } catch (e) {
+        const fallback = {
+            CN: '中国',
+            US: '美国',
+            JP: '日本',
+            KR: '韩国',
+            HK: '中国香港',
+            TW: '中国台湾',
+            SG: '新加坡',
+            DE: '德国',
+            FR: '法国',
+            GB: '英国',
+            AU: '澳大利亚',
+            CA: '加拿大'
+        };
+        return fallback[code] || code;
+    }
+}
+
+function countryCodeToFlagEmoji(countryCode) {
+    const code = String(countryCode || '').trim().toUpperCase();
+    if (!/^[A-Z]{2}$/.test(code)) return '';
+    return String.fromCodePoint(...code.split('').map(ch => 127397 + ch.charCodeAt(0)));
+}
+
+function translateCityNameZh(city) {
+    const text = String(city || '').trim();
+    if (!text) return '';
+    if (/[\u4e00-\u9fff]/.test(text)) return text;
+    const normalized = text
+        .normalize('NFKC')
+        .toLowerCase()
+        .replace(/['`]/g, '')
+        .replace(/[\s-]+/g, '')
+        .replace(/[^a-z]/g, '');
+    return TG_CITY_NAME_ZH[normalized] || text;
+}
+
+function formatVisitorSource(ip, country, city) {
+    const safeIp = String(ip || 'Unknown');
+    const countryName = getCountryNameZh(country);
+    const cityName = translateCityNameZh(city);
+    const flag = countryCodeToFlagEmoji(country);
+    const regionText = cityName ? `${countryName}-${cityName}` : countryName;
+    return `${flag}${regionText} · ${safeIp}`;
+}
+
+function formatWorkerColoLabel(colo) {
+    const key = String(colo || '').trim().toUpperCase();
+    if (key === '获取失败') return '⚠️ 获取失败';
+    const mapped = TG_COLO_LOCATIONS[key];
+    if (mapped) {
+        const flag = countryCodeToFlagEmoji(mapped.country);
+        return `${flag}${getCountryNameZh(mapped.country)}-${mapped.city}`;
+    }
+    return key || '未知';
+}
+
+function formatMsStatus(ms) {
+    if (!Number.isFinite(ms) || ms < 0) return { icon: '🔴', text: '超时' };
+    if (ms < 200) return { icon: '🟢', text: `${ms}MS` };
+    if (ms < 500) return { icon: '🔵', text: `${ms}MS` };
+    if (ms < 1000) return { icon: '🟡', text: `${ms}MS` };
+    return { icon: '🔴', text: `${ms}MS` };
+}
+
+async function probeWorkerColoStatus() {
+    const controller = new AbortController();
+    let timeoutId = null;
+    const startedAt = Date.now();
+    try {
+        timeoutId = setTimeout(() => controller.abort(), 2500);
+        const response = await fetch('https://1.1.1.1/cdn-cgi/trace', {
+            headers: { 'User-Agent': 'Mozilla/5.0 (CF-Worker-Trace)' },
+            signal: controller.signal
+        });
+        const traceText = await response.text();
+        const match = traceText.match(/^colo=([A-Z]+)/m);
+        const colo = match ? match[1] : '未知';
+        return { colo, ms: Date.now() - startedAt };
+    } catch (e) {
+        return { colo: '获取失败', ms: -1 };
+    } finally {
+        if (timeoutId) clearTimeout(timeoutId);
+    }
+}
+
+function buildProxyNodeUrl(proxyOrigin, prefix) {
+    const safeOrigin = String(proxyOrigin || '').replace(/\/+$/, '');
+    const safePrefix = String(prefix || '').replace(/^\/+/, '');
+    return safeOrigin && safePrefix ? `${safeOrigin}/${safePrefix}` : safePrefix;
+}
+
+function formatTelegramLatency(ms) {
+    if (!Number.isFinite(ms) || ms < 0) {
+        return { icon: '🔴', text: '断连/超时' };
+    }
+    if (ms < 200) {
+        return { icon: '🟢', text: `${ms}ms` };
+    }
+    if (ms < 500) {
+        return { icon: '🔵', text: `${ms}ms` };
+    }
+    if (ms < 1000) {
+        return { icon: '🟡', text: `${ms}ms` };
+    }
+    return { icon: '🔴', text: `${ms}ms` };
+}
+
+function parseStoredBeijingTimestamp(value) {
+    const text = String(value || '').trim();
+    const match = text.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?$/);
+    if (!match) return null;
+    const year = Number(match[1]);
+    const month = Number(match[2]);
+    const day = Number(match[3]);
+    const hour = Number(match[4]);
+    const minute = Number(match[5]);
+    const second = Number(match[6] || '0');
+    return Date.UTC(year, month - 1, day, hour - 8, minute, second);
+}
+
+function formatRelativeLastPlay(lastPlay, now = Date.now()) {
+    if (!lastPlay) return '🆕 从未播放';
+    const playedAt = parseStoredBeijingTimestamp(lastPlay);
+    if (!playedAt || Number.isNaN(playedAt)) return String(lastPlay);
+    const diffMs = Math.max(0, now - playedAt);
+    const totalMinutes = Math.floor(diffMs / 60000);
+    if (totalMinutes <= 0) return '刚刚';
+    const days = Math.floor(totalMinutes / 1440);
+    const hours = Math.floor((totalMinutes % 1440) / 60);
+    const minutes = totalMinutes % 60;
+    if (days > 0) return `${days}天${hours}小时${minutes}分钟前`;
+    if (hours > 0) return `${hours}小时${minutes}分钟前`;
+    return `${minutes}分钟前`;
+}
+
+function describeTrafficTrend(currentBytes, baselineBytes) {
+    const current = Number(currentBytes) || 0;
+    const baseline = Number(baselineBytes) || 0;
+    if (baseline <= 0) return current > 0 ? '↑ 高于7日均值' : '→ 接近7日均值';
+    const ratio = current / baseline;
+    if (ratio >= 1.15) return '↑ 高于7日均值';
+    if (ratio <= 0.85) return '↓ 低于7日均值';
+    return '→ 接近7日均值';
+}
+
+async function probeNodeLatency(target, timeoutMs = 2000) {
+    if (!target) return -1;
+    const startedAt = Date.now();
+    const controller = new AbortController();
+    let timeoutId = null;
+    try {
+        timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+        await fetch(target + '/', { method: 'HEAD', signal: controller.signal });
+        return Date.now() - startedAt;
+    } catch (e) {
+        return -1;
+    } finally {
+        if (timeoutId) clearTimeout(timeoutId);
+    }
+}
+
+async function callTelegramApi(env, method, payload) {
+    const response = await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/${method}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+    });
+    const data = await response.json().catch(() => null);
+    if (!response.ok || !data?.ok) {
+        throw new Error(data?.description || `Telegram API ${method} failed`);
+    }
+    return data;
+}
+
+async function answerTgCallback(env, callbackQueryId, text = '') {
+    if (!env.TG_BOT_TOKEN || !callbackQueryId) return;
+    try {
+        await callTelegramApi(env, 'answerCallbackQuery', text
+            ? { callback_query_id: callbackQueryId, text }
+            : { callback_query_id: callbackQueryId });
+    } catch (e) {
+        console.error('TG Callback Answer Error:', e);
     }
 }
 
 // TG 消息发送辅助函数
 async function sendTgMessage(env, chatId, text, messageId = null, extraKeyboard = null) {
     try {
-        const apiUrl = messageId
-            ? `https://api.telegram.org/bot${env.TG_BOT_TOKEN}/editMessageText`
-            : `https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`;
-
         let keyboard = extraKeyboard;
         if (!keyboard) {
             keyboard = [[{ text: '🔄 刷新数据', callback_data: 'refresh_stats' }]];
@@ -3965,12 +4362,7 @@ async function sendTgMessage(env, chatId, text, messageId = null, extraKeyboard 
                 reply_markup: JSON.stringify({ inline_keyboard: keyboard })}
             : { chat_id: chatId, text, parse_mode: 'HTML',
                 reply_markup: JSON.stringify({ inline_keyboard: keyboard })};
-
-        await fetch(apiUrl, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload)
-        });
+        await callTelegramApi(env, messageId ? 'editMessageText' : 'sendMessage', payload);
     } catch (e) {
         console.error('TG Send Error:', e);
     }
@@ -3984,8 +4376,55 @@ function getGreeting(now = Date.now()) {
     return '🌙 晚上好';
 }
 
+function buildTgNodeStatusMessage(routes, page, proxyOrigin, latencyByPrefix, now = Date.now()) {
+    const pageSize = 5;
+    const total = routes.length;
+    const totalPages = Math.max(1, Math.ceil(total / pageSize));
+    const currentPage = Math.min(Math.max(1, page), totalPages);
+    const start = (currentPage - 1) * pageSize;
+    const pageItems = routes.slice(start, start + pageSize);
+
+    const lines = pageItems.map((r, index) => {
+        const serial = start + index + 1;
+        const name = escapeTelegramHtml(r.remark || r.prefix);
+        const proxyUrl = buildProxyNodeUrl(proxyOrigin, r.prefix || '');
+        const latency = formatTelegramLatency(latencyByPrefix?.[r.prefix] ?? -1);
+        const linkLabel = escapeTelegramHtml(String(r.prefix || '').replace(/^\/+/, '') || '-');
+        const directLink = proxyUrl
+            ? `<a href="${escapeTelegramHtml(proxyUrl)}">${linkLabel}</a>`
+            : '-';
+        const lastPlay = escapeTelegramHtml(formatRelativeLastPlay(r.last_play, now));
+        return `│ ${serial}. ${name}\n│    直达: ${directLink}\n│    状态: ${latency.icon} ${latency.text}\n│    末播: ${lastPlay}`;
+    });
+
+    const navRow = [];
+    if (currentPage > 1) {
+        navRow.push({ text: '⬅️ 上一页', callback_data: `node_status:${currentPage - 1}` });
+    }
+    if (currentPage < totalPages) {
+        navRow.push({ text: '下一页 ➡️', callback_data: `node_status:${currentPage + 1}` });
+    }
+
+    const keyboard = [];
+    if (navRow.length) keyboard.push(navRow);
+    keyboard.push([{ text: '🔙 返回统计', callback_data: 'back_to_stats' }]);
+
+    const message =
+        `<b>${getGreeting(now)}，节点状态如下</b>\n` +
+        `━━━━━━━━━━━━━━━━\n\n` +
+        `╭ 📊 节点列表 (${total}) ╮\n` +
+        `│ 共 ${total} 个节点 · 当前第 ${currentPage}/${totalPages} 页\n` +
+        `│ 每页 5 个\n` +
+        lines.join('\n') + '\n' +
+        `╰─────────────╯\n\n` +
+        `━━━━━━━━━━━━━━━━\n` +
+        `⏱️ ${fmtTime(now)}`;
+
+    return { message, keyboard, currentPage, totalPages };
+}
+
 // 节点状态播报
-async function sendTgNodeStatus(env, chatId, messageId = null) {
+async function sendTgNodeStatus(env, chatId, messageId = null, page = 1, proxyOrigin = '') {
     try {
         if (!env.DB) {
             await sendTgMessage(env, chatId, '❌ 数据库未绑定');
@@ -3998,39 +4437,30 @@ async function sendTgNodeStatus(env, chatId, messageId = null) {
             return;
         }
 
-        const now = Date.now();
-
-        const lines = routes.results.map(r => {
-            const name = r.remark || r.prefix;
-            const lastPlay = r.last_play ? `${r.last_play}` : '从未播放';
-            return `│ 📌 ${name}\n│    线路: ${r.target}\n│    末播: ${lastPlay}`;
-        });
-
-        const msg =
-            `<b>${getGreeting()}，节点状态如下</b>\n` +
-            `━━━━━━━━━━━━━━━━\n\n` +
-            `╭ 📊 节点列表 (${routes.results.length}) ╮\n` +
-            lines.join('\n') + '\n' +
-            `╰─────────────╯\n\n` +
-            `━━━━━━━━━━━━━━━━\n` +
-            `⏱️ ${fmtTime(now)}`;
-
-        const keyboard = [[{ text: '🔙 返回统计', callback_data: 'back_to_stats' }]];
+        const resolvedProxyOrigin = String(proxyOrigin || '').replace(/\/+$/, '') || (env.CF_DOMAIN ? `https://${env.CF_DOMAIN}` : '');
+        const pageSize = 5;
+        const totalPages = Math.max(1, Math.ceil(routes.results.length / pageSize));
+        const currentPage = Math.min(Math.max(1, page), totalPages);
+        const start = (currentPage - 1) * pageSize;
+        const pageItems = routes.results.slice(start, start + pageSize);
+        const latencyEntries = await Promise.all(pageItems.map(async route => {
+            const targets = String(route.target || '').split(',').map(s => s.trim()).filter(Boolean);
+            const latency = await probeNodeLatency(targets[0] || '');
+            return [route.prefix, latency];
+        }));
+        const latencyByPrefix = Object.fromEntries(latencyEntries);
+        const { message, keyboard } = buildTgNodeStatusMessage(routes.results, currentPage, resolvedProxyOrigin, latencyByPrefix, Date.now());
 
         if (messageId) {
-            await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/editMessageCaption`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    chat_id: chatId,
-                    message_id: messageId,
-                    caption: msg,
-                    parse_mode: 'HTML',
-                    reply_markup: JSON.stringify({ inline_keyboard: keyboard })
-                })
+            await callTelegramApi(env, 'editMessageCaption', {
+                chat_id: chatId,
+                message_id: messageId,
+                caption: message,
+                parse_mode: 'HTML',
+                reply_markup: JSON.stringify({ inline_keyboard: keyboard })
             });
         } else {
-            await sendTgMessage(env, chatId, msg, null, keyboard);
+            await sendTgMessage(env, chatId, message, null, keyboard);
         }
     } catch (e) {
         console.error('TG NodeStatus Error:', e);
@@ -4127,12 +4557,19 @@ async function sendTgStats(env, chatId, messageId = null) {
         // 使用 Promise.all 并行查询，提高性能
         const DATE_FILTER_YEST = `timestamp >= datetime('now', '-48 hours', '+8 hours') AND timestamp < datetime('now', '-24 hours', '+8 hours')`;
 
-        const [totalQuery, yesterdayQuery, topRegionQuery, topNodeQuery, topClientQuery] = await Promise.all([
+        const [totalQuery, yesterdayQuery, topRegionQuery, topNodeQuery, topClientQuery, workerColoStatus, routesQuery] = await Promise.all([
             env.DB.prepare(`SELECT COUNT(*) as count FROM visitor_logs WHERE ${DATE_FILTER_CST}`).first(),
             env.DB.prepare(`SELECT COUNT(*) as count FROM visitor_logs WHERE ${DATE_FILTER_YEST}`).first(),
-            env.DB.prepare(`SELECT country, COUNT(*) as c FROM visitor_logs WHERE ${DATE_FILTER_CST} GROUP BY country ORDER BY c DESC LIMIT 1`).first(),
             env.DB.prepare(`
-                SELECT r.remark, COUNT(v.id) as c
+                SELECT ip, country, COALESCE(city, '') as city, COUNT(*) as c
+                FROM visitor_logs
+                WHERE ${DATE_FILTER_CST}
+                GROUP BY ip, country, city
+                ORDER BY c DESC
+                LIMIT 1
+            `).first(),
+            env.DB.prepare(`
+                SELECT v.prefix, r.remark, COUNT(v.id) as c
                 FROM visitor_logs v
                 LEFT JOIN routes r ON v.prefix = r.prefix
                 WHERE ${DATE_FILTER_CST.replace(/timestamp/g, 'v.timestamp')}
@@ -4147,7 +4584,9 @@ async function sendTgStats(env, chatId, messageId = null) {
                 AND ua IS NOT NULL
                 GROUP BY ua
                 ORDER BY c DESC LIMIT 5
-            `).all()
+            `).all(),
+            probeWorkerColoStatus(),
+            env.DB.prepare(`SELECT prefix, remark FROM routes ORDER BY sort_order ASC, prefix ASC`).all()
         ]);
         
         // 构建客户端统计消息（按观看次数排序）
@@ -4166,22 +4605,24 @@ async function sendTgStats(env, chatId, messageId = null) {
                 .slice(0, 5)
                 .map(([name, count], i) => {
                     const rankEmoji = ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣'][i];
-                    return `│ ${rankEmoji} ${getClientIcon(name)} ${name}   ${count}次`;
+                    return `│ ${rankEmoji} ${getClientIcon(name)} ${name} · ${count}次`;
                 }).join('\n');
         }
         
         // 获取多时间维度流量
-        const [trafficToday, traffic7d, traffic30d] = await Promise.all([
-            getCFTraffic(env, 'today'),
-            getCFTraffic(env, 7),
-            getCFTraffic(env, 30)
+        const [trafficTodayRaw, traffic7dRaw, traffic30dRaw] = await Promise.all([
+            getCFTrafficBytes(env, 'today'),
+            getCFTrafficBytes(env, 7),
+            getCFTrafficBytes(env, 30)
         ]);
+        const trafficToday = typeof trafficTodayRaw === 'number' ? (trafficTodayRaw === 0 ? '0 B' : formatBytes(trafficTodayRaw)) : trafficTodayRaw;
+        const traffic7d = typeof traffic7dRaw === 'number' ? (traffic7dRaw === 0 ? '0 B' : formatBytes(traffic7dRaw)) : traffic7dRaw;
+        const traffic30d = typeof traffic30dRaw === 'number' ? (traffic30dRaw === 0 ? '0 B' : formatBytes(traffic30dRaw)) : traffic30dRaw;
 
-        // ================= 新增：获取今日流量消耗 TOP 1 节点 =================
-        let topNodeMsg = "暂无数据";
+        let bytesByRoute = new Map();
         if (env.CF_API_TOKEN && env.CF_ZONE_ID && env.DB) {
             try {
-                const { results: routes } = await env.DB.prepare(`SELECT prefix, remark FROM routes`).all();
+                const routes = routesQuery?.results || [];
                 if (routes && routes.length > 0) {
                     const end = new Date();
                     const beijingTime = new Date(end.getTime() + 8 * 3600000);
@@ -4190,31 +4631,12 @@ async function sendTgStats(env, chatId, messageId = null) {
                     const endISO = end.toISOString();
                     const startISO = start.toISOString();
 
-                    const bytesByRoute = await queryTrafficByPrefixes(env, routes, startISO, endISO);
-
-                    // 找出流量最大的节点
-                    let maxBytes = 0;
-                    let topNodeName = "无";
-                    bytesByRoute.forEach((bytes, prefix) => {
-                        if (bytes > maxBytes) {
-                            maxBytes = bytes;
-                            const matchedRoute = routes.find(r => r.prefix === prefix);
-                            topNodeName = matchedRoute?.remark || prefix;
-                        }
-                    });
-
-                    // 转换字节并组装文本
-                    if (maxBytes > 0) {
-                        topNodeMsg = `${topNodeName} 跑了 ${formatBytes(maxBytes)}`;
-                    } else {
-                        topNodeMsg = "今日全站零消耗";
-                    }
+                    bytesByRoute = await queryTrafficByPrefixes(env, routes, startISO, endISO);
                 }
             } catch (e) {
-                topNodeMsg = "获取失败";
+                bytesByRoute = new Map();
             }
         }
-        // ====================================================================
 
         // 使用可选链简化空值判断
         const todayCount = totalQuery?.count ?? 0;
@@ -4227,15 +4649,37 @@ async function sendTgStats(env, chatId, messageId = null) {
             if (diff < 0) return `📉 ${pct}%`;
             return '➖ 持平';
         })();
-        const totalStr = `${todayCount}次 ${trendStr}`;
-        const regionStr = topRegionQuery ? `${topRegionQuery.country === 'CN' ? '🇨🇳 中国大陆' : topRegionQuery.country} (${topRegionQuery.c}次)` : '暂无记录';
+        const totalStr = `${todayCount}次 · ${trendStr}`;
+        const regionStr = topRegionQuery
+            ? `${escapeTelegramHtml(truncateTelegramText(formatVisitorSource(topRegionQuery.ip, topRegionQuery.country, topRegionQuery.city), 56))} · ${topRegionQuery.c}次`
+            : '暂无记录';
+        const workerColoStr = escapeTelegramHtml(formatWorkerColoLabel(workerColoStatus?.colo));
+        const routes = routesQuery?.results || [];
         const nodeStr = topNodeQuery?.results?.length > 0
             ? topNodeQuery.results.map((r, i) => {
                 const rank = ['🥇', '🥈', '🥉'][i];
-                const name = r.remark || '未命名节点';
-                return `│ ${rank} ${name}   ${r.c}次`;
+                const name = truncateTelegramText(r.remark || '未命名节点', 18);
+                const trafficText = formatBytes(bytesByRoute.get(r.prefix) || 0);
+                return `│ ${rank} ${escapeTelegramHtml(name)} · ${r.c}次 · ${trafficText}`;
             }).join('\n')
             : '暂无记录';
+        const avg7dBytes = typeof traffic7dRaw === 'number' ? traffic7dRaw / 7 : null;
+        const avg30dBytes = typeof traffic30dRaw === 'number' ? traffic30dRaw / 30 : null;
+        const todayTrafficTrend = (typeof trafficTodayRaw === 'number' && avg7dBytes !== null)
+            ? describeTrafficTrend(trafficTodayRaw, avg7dBytes)
+            : '→ 接近7日均值';
+        const weekTrafficTrend = (avg7dBytes !== null && avg30dBytes !== null)
+            ? (() => {
+                const ratio = avg30dBytes > 0 ? avg7dBytes / avg30dBytes : 0;
+                if (avg30dBytes <= 0) return '→ 接近30日均值';
+                if (ratio >= 1.15) return '↑ 高于30日均值';
+                if (ratio <= 0.85) return '↓ 低于30日均值';
+                return '→ 接近30日均值';
+            })()
+            : '→ 接近30日均值';
+        const trafficTodayLine = `${trafficToday} · ${todayTrafficTrend}`;
+        const traffic7dLine = `${traffic7d} · ${weekTrafficTrend}`;
+        const traffic30dLine = `${traffic30d} · → 长周期稳定`;
 
         const now = new Date();
         const greeting = getGreeting();
@@ -4244,22 +4688,22 @@ async function sendTgStats(env, chatId, messageId = null) {
             `<b>${greeting}，运行数据已更新</b>\n` +
             `━━━━━━━━━━━━━━━━\n\n` +
             `╭ 📊 访问统计 ╮\n` +
-            `│ 📺 今日播放     ${totalStr}\n` +
-            `│ 🌍 热门地区     ${regionStr}\n` +
+            `│ 今日播放：${totalStr}\n` +
+            `│ 热门来源：${regionStr}\n` +
+            `╰─────────────╯\n\n` +
+            `╭ 📡Worker 落地机房 ╮\n` +
+            `│ ${workerColoStr}\n` +
             `╰─────────────╯\n\n` +
             `╭ 🚀 热门节点 Top3 ╮\n` +
             `${nodeStr}\n` +
             `╰─────────────╯\n\n` +
-            `╭ 📱 客户端分布 ╮\n` +
+            `╭ 📱 客户端分布 Top5 ╮\n` +
             `${clientStr}\n` +
             `╰─────────────╯\n\n` +
             `╭ 🌐 流量消耗 ╮\n` +
-            `│ 当天     ${trafficToday}\n` +
-            `│ 7天      ${traffic7d}\n` +
-            `│ 30天     ${traffic30d}\n` +
-            `╰─────────────╯\n\n` +
-            `╭ 🏆 流量之王 ╮\n` +
-            `│ 👑 ${topNodeMsg}\n` +
+            `│ 今日：${trafficTodayLine}\n` +
+            `│ 7天：${traffic7dLine}\n` +
+            `│ 30天：${traffic30dLine}\n` +
             `╰─────────────╯\n\n` +
             `━━━━━━━━━━━━━━━━\n` +
             `⏱️ ${fmtTime(now)} 更新`;
@@ -4572,12 +5016,17 @@ export default {
                 // 处理按钮回调
                 if (body.callback_query) {
                     const callbackData = body.callback_query.data;
+                    const callbackQueryId = body.callback_query.id;
                     const chatId = body.callback_query.message.chat.id;
                     const messageId = body.callback_query.message.message_id;
+                    ctx.waitUntil(answerTgCallback(env, callbackQueryId));
                     if (callbackData === 'refresh_stats' && env.DB && env.TG_BOT_TOKEN) {
                         ctx.waitUntil(sendTgStats(env, chatId, messageId));
-                    } else if (callbackData === 'node_status' && env.DB && env.TG_BOT_TOKEN) {
-                        ctx.waitUntil(sendTgNodeStatus(env, chatId, messageId));
+                    } else if ((callbackData === 'node_status' || callbackData.startsWith('node_status:')) && env.DB && env.TG_BOT_TOKEN) {
+                        const page = callbackData === 'node_status'
+                            ? 1
+                            : Math.max(1, parseInt(callbackData.split(':')[1], 10) || 1);
+                        ctx.waitUntil(sendTgNodeStatus(env, chatId, messageId, page, url.origin));
                     } else if (callbackData === 'back_to_stats' && env.DB && env.TG_BOT_TOKEN) {
                         ctx.waitUntil(sendTgStats(env, chatId, messageId));
                     }
@@ -4611,7 +5060,7 @@ export default {
                 const [trend, locations, recents] = await Promise.all([
                     env.DB.prepare(`SELECT date(timestamp, '+8 hours') as date, COUNT(*) as count FROM visitor_logs WHERE ${DATE_FILTER_7D} GROUP BY date(timestamp, '+8 hours') ORDER BY date ASC`).all(),
                     env.DB.prepare(`SELECT country, COUNT(*) as count FROM visitor_logs WHERE ${DATE_FILTER_7D} GROUP BY country ORDER BY count DESC`).all(),
-                    env.DB.prepare(`SELECT prefix, datetime(timestamp, '+8 hours') as timestamp, ip, country, ua FROM visitor_logs ORDER BY timestamp DESC LIMIT 20`).all()
+                    env.DB.prepare(`SELECT prefix, datetime(timestamp, '+8 hours') as timestamp, ip, country, COALESCE(city, '') as city, ua FROM visitor_logs ORDER BY timestamp DESC LIMIT 20`).all()
                 ]);
                 
                 return Response.json({ 
@@ -4940,11 +5389,12 @@ export default {
             await env.DB.exec(`CREATE TABLE IF NOT EXISTS routes (prefix TEXT PRIMARY KEY, target TEXT NOT NULL)`);
             await env.DB.exec(`CREATE TABLE IF NOT EXISTS request_stats (prefix TEXT, date TEXT, count INTEGER DEFAULT 0, PRIMARY KEY(prefix, date))`);
             // 大数据记录核心表：访客日志
-            await env.DB.exec(`CREATE TABLE IF NOT EXISTS visitor_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, prefix TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP, ip TEXT, country TEXT, ua TEXT)`);
+            await env.DB.exec(`CREATE TABLE IF NOT EXISTS visitor_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, prefix TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP, ip TEXT, country TEXT, city TEXT DEFAULT '', ua TEXT)`);
             
             // 添加索引提升查询性能
             try { await env.DB.exec(`CREATE INDEX IF NOT EXISTS idx_visitor_logs_country ON visitor_logs(country)`); } catch(e) {}
             try { await env.DB.exec(`CREATE INDEX IF NOT EXISTS idx_visitor_logs_timestamp ON visitor_logs(timestamp)`); } catch(e) {}
+            try { await env.DB.exec(`ALTER TABLE visitor_logs ADD COLUMN city TEXT DEFAULT ''`); } catch(e) {}
             
             try { await env.DB.exec(`ALTER TABLE routes ADD COLUMN mode TEXT DEFAULT 'off'`); } catch(e) {}
             try { await env.DB.exec(`ALTER TABLE routes ADD COLUMN remark TEXT DEFAULT ''`); } catch(e) {}
@@ -5866,8 +6316,9 @@ export default {
 
                 const clientIp = request.headers.get("cf-connecting-ip") || request.headers.get("x-real-ip") || "Unknown";
                 const clientCountry = request.headers.get("cf-ipcountry") || "Unknown";
+                const clientCity = request.cf?.city || "";
                 const clientUa = request.headers.get("User-Agent") || "Unknown";
-                stmts.push(env.DB.prepare(`INSERT INTO visitor_logs (prefix, ip, country, ua) VALUES (?, ?, ?, ?)`).bind(matchedPrefix, clientIp, clientCountry, clientUa));
+                stmts.push(env.DB.prepare(`INSERT INTO visitor_logs (prefix, ip, country, city, ua) VALUES (?, ?, ?, ?, ?)`).bind(matchedPrefix, clientIp, clientCountry, clientCity, clientUa));
 
                 ctx.waitUntil(env.DB.batch(stmts));
             } catch(e) {}
