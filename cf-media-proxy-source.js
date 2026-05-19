@@ -4689,7 +4689,7 @@ async function sendTgStats(env, chatId, messageId = null) {
             `━━━━━━━━━━━━━━━━\n\n` +
             `╭ 📊 访问统计 ╮\n` +
             `│ 今日播放：${totalStr}\n` +
-            `│ 热门来源：${regionStr}\n` +
+            `│ 热门访客：${regionStr}\n` +
             `╰─────────────╯\n\n` +
             `╭ 📡Worker 落地机房 ╮\n` +
             `│ ${workerColoStr}\n` +
