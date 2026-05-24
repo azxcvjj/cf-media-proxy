@@ -1,6 +1,6 @@
-// VERSION: 2.1.1.0
+// VERSION: 2.1.1.1
 // 🟢 面板核心配置区 (放在最顶端方便修改)
-const CURRENT_VERSION = "2.1.1.0";
+const CURRENT_VERSION = "2.1.1.1";
 const GITHUB_RAW_URL = "https://raw.githubusercontent.com/azxcvjj/cf-media-proxy/main/cf-media-proxy.js";
 
 // ==========================================
@@ -38,6 +38,46 @@ const MAX_DNS_RECORDS = 20;
 const MAX_REWRITE_BODY_BYTES = 5 * 1024 * 1024;
 const MAX_REPLAY_BODY_BYTES = 8 * 1024 * 1024;
 const MAX_REMOTE_IP_LIST_BYTES = 512 * 1024;
+const MAX_JSON_REWRITE_DEPTH = 12;
+const ROUTE_CACHE_TTL_MS = 30 * 1000;
+const SETTINGS_CACHE_TTL_MS = 30 * 1000;
+const GRAPHQL_TRAFFIC_CACHE_TTL_MS = 5 * 60 * 1000;
+const PLAY_SESSION_DEDUPE_TTL_MS = 60 * 1000;
+
+const ROUTE_BY_PREFIX_CACHE = new Map();
+const GENERAL_PROXY_ENABLED_CACHE = new Map();
+const CF_TOTAL_TRAFFIC_CACHE = new Map();
+const CF_PREFIX_TRAFFIC_CACHE = new Map();
+const PLAY_SESSION_DEDUPE_CACHE = new Map();
+
+function getMemoryCache(cache, key) {
+    const hit = cache.get(key);
+    if (!hit) return undefined;
+    if (hit.expiresAt <= Date.now()) {
+        cache.delete(key);
+        return undefined;
+    }
+    return hit.value;
+}
+
+function setMemoryCache(cache, key, value, ttlMs) {
+    cache.set(key, { value, expiresAt: Date.now() + ttlMs });
+    return value;
+}
+
+function buildPlaySessionDedupeKey(prefix, ip, ua) {
+    const normalizedPrefix = String(prefix || '').trim();
+    const normalizedIp = String(ip || 'Unknown').trim();
+    const normalizedUa = String(ua || 'Unknown').slice(0, 160);
+    return `${normalizedPrefix}|${normalizedIp}|${normalizedUa}`;
+}
+
+function shouldRecordPlaySession(prefix, ip, ua) {
+    const key = buildPlaySessionDedupeKey(prefix, ip, ua);
+    if (getMemoryCache(PLAY_SESSION_DEDUPE_CACHE, key)) return false;
+    setMemoryCache(PLAY_SESSION_DEDUPE_CACHE, key, true, PLAY_SESSION_DEDUPE_TTL_MS);
+    return true;
+}
 
 // 统一时间格式化（北京时间，固定格式）
 function fmtTime(ts) {
@@ -291,6 +331,21 @@ async function queryTrafficByPrefixes(env, routes, startISO, endISO, batchSize =
         }
     }
 
+    return bytesMap;
+}
+
+function buildPrefixTrafficCacheKey(env, routes, startISO) {
+    const routeKey = routes.map(r => r.prefix).join('|');
+    return `${env.CF_ZONE_ID || ''}:${startISO}:${routeKey}`;
+}
+
+async function queryTrafficByPrefixesCached(env, routes, startISO, endISO, batchSize = 10) {
+    const key = buildPrefixTrafficCacheKey(env, routes, startISO);
+    const cached = getMemoryCache(CF_PREFIX_TRAFFIC_CACHE, key);
+    if (cached instanceof Map) return new Map(cached);
+
+    const bytesMap = await queryTrafficByPrefixes(env, routes, startISO, endISO, batchSize);
+    setMemoryCache(CF_PREFIX_TRAFFIC_CACHE, key, new Map(bytesMap), GRAPHQL_TRAFFIC_CACHE_TTL_MS);
     return bytesMap;
 }
 
@@ -4023,11 +4078,69 @@ async function getCFTrafficBytes(env, type) {
     }
 }
 
+async function getCachedCFTrafficBytes(env, type) {
+    const key = `${env.CF_ZONE_ID || ''}:${type}`;
+    const cached = getMemoryCache(CF_TOTAL_TRAFFIC_CACHE, key);
+    if (typeof cached === 'number') return cached;
+
+    const result = await getCFTrafficBytes(env, type);
+    if (typeof result === 'number') {
+        setMemoryCache(CF_TOTAL_TRAFFIC_CACHE, key, result, GRAPHQL_TRAFFIC_CACHE_TTL_MS);
+    }
+    return result;
+}
+
 // getCFTraffic 使用顶部工具区的 formatBytes 函数
 async function getCFTraffic(env, type) {
-    const result = await getCFTrafficBytes(env, type);
+    const result = await getCachedCFTrafficBytes(env, type);
     if (typeof result !== 'number') return result;
     return result === 0 ? '0 B' : formatBytes(result);
+}
+
+function clearRoutesCache(prefix = null) {
+    if (prefix) {
+        ROUTE_BY_PREFIX_CACHE.delete(prefix);
+        return;
+    }
+    ROUTE_BY_PREFIX_CACHE.clear();
+}
+
+async function getCachedRouteByPrefix(env, prefix) {
+    const cached = getMemoryCache(ROUTE_BY_PREFIX_CACHE, prefix);
+    if (cached !== undefined) return cached;
+    if (!env.DB) return null;
+
+    const route = await env.DB.prepare(`SELECT target, mode, cache_img FROM routes WHERE prefix = ?`).bind(prefix).first();
+    setMemoryCache(ROUTE_BY_PREFIX_CACHE, prefix, route || null, ROUTE_CACHE_TTL_MS);
+    return route || null;
+}
+
+function setGeneralProxyEnabledCache(enabled) {
+    return setMemoryCache(GENERAL_PROXY_ENABLED_CACHE, 'general_proxy_enabled', !!enabled, SETTINGS_CACHE_TTL_MS);
+}
+
+async function getGeneralProxyEnabledCached(env) {
+    const cached = getMemoryCache(GENERAL_PROXY_ENABLED_CACHE, 'general_proxy_enabled');
+    if (typeof cached === 'boolean') return cached;
+
+    let enabled = ALLOW_GENERAL_PROXY;
+    if (env.DB) {
+        try {
+            await env.DB.exec(`CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)`);
+            const result = await env.DB.prepare('SELECT value FROM settings WHERE key = ?').bind('general_proxy_enabled').first();
+            if (result && result.value !== null) enabled = result.value === 'true';
+        } catch(e) {
+            console.error('D1读取通用反代状态失败，使用默认值:', e);
+        }
+    } else if (env.SETTINGS) {
+        try {
+            const kvValue = await env.SETTINGS.get('general_proxy_enabled');
+            if (kvValue !== null) enabled = kvValue === 'true';
+        } catch(e) {
+            console.error('KV读取通用反代状态失败，使用默认值:', e);
+        }
+    }
+    return setGeneralProxyEnabledCache(enabled);
 }
 
 function escapeTelegramHtml(value) {
@@ -4611,9 +4724,9 @@ async function sendTgStats(env, chatId, messageId = null) {
         
         // 获取多时间维度流量
         const [trafficTodayRaw, traffic7dRaw, traffic30dRaw] = await Promise.all([
-            getCFTrafficBytes(env, 'today'),
-            getCFTrafficBytes(env, 7),
-            getCFTrafficBytes(env, 30)
+            getCachedCFTrafficBytes(env, 'today'),
+            getCachedCFTrafficBytes(env, 7),
+            getCachedCFTrafficBytes(env, 30)
         ]);
         const trafficToday = typeof trafficTodayRaw === 'number' ? (trafficTodayRaw === 0 ? '0 B' : formatBytes(trafficTodayRaw)) : trafficTodayRaw;
         const traffic7d = typeof traffic7dRaw === 'number' ? (traffic7dRaw === 0 ? '0 B' : formatBytes(traffic7dRaw)) : traffic7dRaw;
@@ -4631,7 +4744,7 @@ async function sendTgStats(env, chatId, messageId = null) {
                     const endISO = end.toISOString();
                     const startISO = start.toISOString();
 
-                    bytesByRoute = await queryTrafficByPrefixes(env, routes, startISO, endISO);
+                    bytesByRoute = await queryTrafficByPrefixesCached(env, routes, startISO, endISO);
                 }
             } catch (e) {
                 bytesByRoute = new Map();
@@ -4873,34 +4986,7 @@ export default {
         // 获取当前开关状态
         if (url.pathname === '/api/general-proxy-status' && request.method === 'GET') {
             try {
-                // 默认值：true (开启)
-                let enabled = ALLOW_GENERAL_PROXY;
-                
-                // 优先从 D1 数据库读取（更可靠）
-                if (env.DB) {
-                    try {
-                        // 确保 settings 表存在
-                        await env.DB.exec(`CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)`);
-                        const result = await env.DB.prepare('SELECT value FROM settings WHERE key = ?').bind('general_proxy_enabled').first();
-                        if (result && result.value !== null) {
-                            enabled = result.value === 'true';
-                        }
-                    } catch(e) {
-                        console.error('D1读取失败，使用默认值:', e);
-                    }
-                }
-                
-                // 备选：从 KV 读取（向后兼容）
-                else if (env.SETTINGS) {
-                    try {
-                        const kvValue = await env.SETTINGS.get('general_proxy_enabled');
-                        if (kvValue !== null) {
-                            enabled = kvValue === 'true';
-                        }
-                    } catch(e) {
-                        console.error('KV读取失败，使用默认值:', e);
-                    }
-                }
+                const enabled = await getGeneralProxyEnabledCached(env);
                 
                 return new Response(JSON.stringify({
                     success: true,
@@ -4954,6 +5040,7 @@ export default {
                 else if (env.SETTINGS) {
                     await env.SETTINGS.put('general_proxy_enabled', enabled.toString());
                 }
+                setGeneralProxyEnabledCache(enabled);
                 
                 return new Response(JSON.stringify({
                     success: true,
@@ -5426,7 +5513,7 @@ export default {
                     const startISO = start.toISOString();
 
                     try {
-                        const bytesMap = await queryTrafficByPrefixes(env, routes, startISO, endISO);
+                        const bytesMap = await queryTrafficByPrefixesCached(env, routes, startISO, endISO);
 
                         routes.forEach(r => {
                             const bytes = bytesMap.get(r.prefix) || 0;
@@ -5462,6 +5549,8 @@ export default {
 
                 await env.DB.prepare('INSERT OR REPLACE INTO routes (prefix, target, mode, remark, icon, cache_img, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?)')
                     .bind(route.prefix, route.target, route.mode, route.remark, route.icon, route.cache_img, currentSortOrder).run();
+                clearRoutesCache(route.prefix);
+                if (route.oldPrefix && route.oldPrefix !== route.prefix) clearRoutesCache(route.oldPrefix);
                 return Response.json({ success: true });
             }
 
@@ -5480,6 +5569,7 @@ export default {
                     const placeholders = data.prefixes.map(() => '?').join(',');
                     await env.DB.prepare(`UPDATE routes SET mode = ? WHERE prefix IN (${placeholders})`)
                         .bind(data.mode, ...data.prefixes).run();
+                    clearRoutesCache();
                     return Response.json({ success: true });
                 }
                 return Response.json({ success: false, error: 'Invalid parameters' });
@@ -5488,7 +5578,7 @@ export default {
             if (request.method === 'DELETE') {
                 const prefix = url.searchParams.get('prefix');
                 if (!isValidRoutePrefix(String(prefix || ''))) return Response.json({ success: false, error: 'Invalid prefix' }, { status: 400 });
-                await env.DB.prepare('DELETE FROM routes WHERE prefix = ?').bind(prefix).run(); return Response.json({ success: true });
+                await env.DB.prepare('DELETE FROM routes WHERE prefix = ?').bind(prefix).run(); clearRoutesCache(prefix); return Response.json({ success: true });
             }
             return new Response("Method not allowed", { status: 405 });
         }
@@ -5625,12 +5715,30 @@ export default {
             return SERVER_ADDRESS_FIELDS.has(key);
         }
         
-        function rewriteSourceUrlsInJson(value, targetOrigins, proxyOrigin, safePrefix) {
-            if (typeof value === 'string') return rewriteSourceUrlString(value, targetOrigins, proxyOrigin, safePrefix);
+        function shouldRewriteJsonString(value, targetOrigins) {
+            if (typeof value !== 'string' || value.length === 0) return false;
+            const lower = value.toLowerCase();
+            if (!lower.includes('http://') && !lower.includes('https://') && !lower.includes('/img/') && !lower.includes('/images/') && !lower.includes('/items/') && !lower.includes('/emby/items/')) {
+                return false;
+            }
+            return targetOrigins.some(origin => value.includes(origin))
+                || lower.includes('/img/')
+                || lower.includes('/images/')
+                || lower.includes('/items/')
+                || lower.includes('/emby/items/');
+        }
+        
+        function rewriteSourceUrlsInJson(value, targetOrigins, proxyOrigin, safePrefix, depth = 0) {
+            if (typeof value === 'string') {
+                return shouldRewriteJsonString(value, targetOrigins)
+                    ? rewriteSourceUrlString(value, targetOrigins, proxyOrigin, safePrefix)
+                    : value;
+            }
+            if (depth >= MAX_JSON_REWRITE_DEPTH) return value;
             if (Array.isArray(value)) {
                 let changed = false;
                 const next = value.map(item => {
-                    const rewritten = rewriteSourceUrlsInJson(item, targetOrigins, proxyOrigin, safePrefix);
+                    const rewritten = rewriteSourceUrlsInJson(item, targetOrigins, proxyOrigin, safePrefix, depth + 1);
                     if (rewritten !== item) changed = true;
                     return rewritten;
                 });
@@ -5641,11 +5749,15 @@ export default {
                 const next = {};
                 for (const key of Object.keys(value)) {
                     // 服务器地址字段也重写（支持 Forward 等客户端的自动更新功能）
-                    if (isServerAddressField(key)) {
-                        next[key] = rewriteSourceUrlString(value[key], targetOrigins, proxyOrigin, safePrefix);
+                    if (isServerAddressField(key) && typeof value[key] === 'string') {
+                        const rewritten = shouldRewriteJsonString(value[key], targetOrigins)
+                            ? rewriteSourceUrlString(value[key], targetOrigins, proxyOrigin, safePrefix)
+                            : value[key];
+                        if (rewritten !== value[key]) changed = true;
+                        next[key] = rewritten;
                         continue;
                     }
-                    const rewritten = rewriteSourceUrlsInJson(value[key], targetOrigins, proxyOrigin, safePrefix);
+                    const rewritten = rewriteSourceUrlsInJson(value[key], targetOrigins, proxyOrigin, safePrefix, depth + 1);
                     if (rewritten !== value[key]) changed = true;
                     next[key] = rewritten;
                 }
@@ -6166,6 +6278,35 @@ export default {
             return false;
         }
 
+        function applyProxyCacheHeaders(headers, request, pathname, enableCache) {
+            const contentType = headers.get("content-type") || "";
+            const isStaticRes = isStaticPath(pathname);
+            const canCacheStaticRes = isStaticRes
+                && enableCache
+                && !hasAuthLikeState(new Headers(request.headers), new URL(request.url))
+                && !/application\/json/i.test(contentType);
+
+            if (canCacheStaticRes) {
+                headers.set('Cache-Control', 'public, max-age=86400');
+                headers.delete('Expires');
+                headers.delete('Pragma');
+            } else {
+                headers.set('Cache-Control', 'no-store');
+            }
+        }
+
+        function shouldBypassBodyRewrite(request, pathname, headers, status) {
+            const lowerPath = (pathname || '').toLowerCase();
+            const contentType = headers.get("content-type") || "";
+            if (/playbackinfo/i.test(lowerPath)) return false;
+            if (/\.m3u8(?:$|\?)/i.test(lowerPath) || /(?:mpegurl|vnd\.apple\.mpegurl)/i.test(contentType)) return false;
+            if (/json|xml|text\/html/i.test(contentType)) return false;
+            if (request.headers.has("Range") || status === 206) return true;
+            if (/^(video|audio)\//i.test(contentType)) return true;
+            if (/^(image|font)\//i.test(contentType) || /application\/(?:octet-stream|x-mpegurl|x-font|font-woff)/i.test(contentType)) return true;
+            return looksLikeMediaPath(lowerPath) && !/\.(json|xml|m3u8)(?:$|\?)/i.test(lowerPath);
+        }
+
         // 获取请求类型用于日志分级
         function getRequestCategory(path) {
             const lower = (path || '').toLowerCase();
@@ -6180,32 +6321,8 @@ export default {
 
         if (isLegacyGeneralProxyPath || isEncodedGeneralProxyPath) {
             // 🚫 通用反代访问控制检查
-            // 优先从 D1 数据库读取配置，如果失败则使用代码常量
-            let isAllowed = ALLOW_GENERAL_PROXY;
-            
-            // 优先从 D1 数据库读取（更可靠）
-            if (env.DB) {
-                try {
-                    await env.DB.exec(`CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)`);
-                    const result = await env.DB.prepare('SELECT value FROM settings WHERE key = ?').bind('general_proxy_enabled').first();
-                    if (result && result.value !== null) {
-                        isAllowed = result.value === 'true';
-                    }
-                } catch(e) {
-                    console.error('D1读取通用反代状态失败，使用默认值:', e);
-                }
-            }
-            // 备选：从 KV 读取（向后兼容）
-            else if (env.SETTINGS) {
-                try {
-                    const kvValue = await env.SETTINGS.get('general_proxy_enabled');
-                    if (kvValue !== null) {
-                        isAllowed = kvValue === 'true';
-                    }
-                } catch(e) {
-                    console.error('KV读取通用反代状态失败，使用默认值:', e);
-                }
-            }
+            // 优先从短 TTL 内存缓存读取配置，缓存失效后再回源到 D1/KV。
+            const isAllowed = await getGeneralProxyEnabledCached(env);
             
             if (!isAllowed) {
                 return new Response(
@@ -6265,8 +6382,7 @@ export default {
 
             try {
                 if (!env.DB) return new Response(`404: Node not found (DB not bound)`, { status: 404 });
-                const stmt = env.DB.prepare(`SELECT target, mode, cache_img FROM routes WHERE prefix = ?`);
-                const route = await stmt.bind(prefix).first();
+                const route = await getCachedRouteByPrefix(env, prefix);
                 if (!route) return new Response(`404: Node not found`, { status: 404 });
 
                 currentMode = route.mode || 'off'; enableCache = (route.cache_img !== 'off');
@@ -6306,21 +6422,23 @@ export default {
         // 核心修改：仅在点火请求时才记录 "今日播放" 和 "最后活跃"
         if (isNewPlaySession && matchedPrefix && env.DB && ctx && ctx.waitUntil) {
             try {
-                const todayStr = new Date(Date.now() + 8 * 3600000).toISOString().split('T')[0];
-                const nowTime = new Date(Date.now() + 8 * 3600000).toISOString().replace('T', ' ').split('.')[0]; 
-                
-                let stmts = [
-                    env.DB.prepare(`INSERT INTO request_stats (prefix, date, count) VALUES (?, ?, 1) ON CONFLICT(prefix, date) DO UPDATE SET count = count + 1`).bind(matchedPrefix, todayStr),
-                    env.DB.prepare(`UPDATE routes SET last_play = ? WHERE prefix = ?`).bind(nowTime, matchedPrefix)
-                ];
-
                 const clientIp = request.headers.get("cf-connecting-ip") || request.headers.get("x-real-ip") || "Unknown";
-                const clientCountry = request.headers.get("cf-ipcountry") || "Unknown";
-                const clientCity = request.cf?.city || "";
                 const clientUa = request.headers.get("User-Agent") || "Unknown";
-                stmts.push(env.DB.prepare(`INSERT INTO visitor_logs (prefix, ip, country, city, ua) VALUES (?, ?, ?, ?, ?)`).bind(matchedPrefix, clientIp, clientCountry, clientCity, clientUa));
+                if (shouldRecordPlaySession(matchedPrefix, clientIp, clientUa)) {
+                    const todayStr = new Date(Date.now() + 8 * 3600000).toISOString().split('T')[0];
+                    const nowTime = new Date(Date.now() + 8 * 3600000).toISOString().replace('T', ' ').split('.')[0]; 
+                    
+                    let stmts = [
+                        env.DB.prepare(`INSERT INTO request_stats (prefix, date, count) VALUES (?, ?, 1) ON CONFLICT(prefix, date) DO UPDATE SET count = count + 1`).bind(matchedPrefix, todayStr),
+                        env.DB.prepare(`UPDATE routes SET last_play = ? WHERE prefix = ?`).bind(nowTime, matchedPrefix)
+                    ];
 
-                ctx.waitUntil(env.DB.batch(stmts));
+                    const clientCountry = request.headers.get("cf-ipcountry") || "Unknown";
+                    const clientCity = request.cf?.city || "";
+                    stmts.push(env.DB.prepare(`INSERT INTO visitor_logs (prefix, ip, country, city, ua) VALUES (?, ?, ?, ?, ?)`).bind(matchedPrefix, clientIp, clientCountry, clientCity, clientUa));
+
+                    ctx.waitUntil(env.DB.batch(stmts));
+                }
             } catch(e) {}
         }
 
@@ -6443,9 +6561,15 @@ export default {
         // 2.10 响应体重写 (接管 PlaybackInfo 与 M3U8)
         // ==========================================
 
+        if (shouldBypassBodyRewrite(request, url.pathname, responseHeaders, finalResponse.status)) {
+            applyProxyCacheHeaders(responseHeaders, request, url.pathname, enableCache);
+            return new Response(finalResponse.body, { status: finalResponse.status, statusText: finalResponse.statusText, headers: responseHeaders });
+        }
+
         // 🔒 PlaybackInfo 完整修复：支持所有地址格式 + 字幕流 DeliveryUrl
         // ⚠️ 透传模式下跳过响应重写，因为客户端期望收到源站真实 URL
-        if (!isPassthroughMode && finalResponse.status === 200 && responseHeaders.get("content-type")?.includes("json") && url.pathname.toLowerCase().includes("playbackinfo")) {
+        const isPlaybackInfoJson = !isPassthroughMode && finalResponse.status === 200 && responseHeaders.get("content-type")?.includes("json") && url.pathname.toLowerCase().includes("playbackinfo");
+        if (isPlaybackInfoJson) {
             try {
                 let clonedRes = finalResponse.clone();
                 let data = JSON.parse(await readResponseTextWithinLimit(clonedRes, MAX_REWRITE_BODY_BYTES));
@@ -6491,7 +6615,7 @@ export default {
         // 例如详情页、图片列表或插件接口返回了源站绝对地址/相对图片路径。
         // ⚠️ 透传模式下跳过响应重写
         // ==========================================
-        if (!isPassthroughMode && finalResponse.status === 200 && responseHeaders.get("content-type")?.includes("json")) {
+        if (!isPlaybackInfoJson && !isPassthroughMode && finalResponse.status === 200 && responseHeaders.get("content-type")?.includes("json")) {
             try {
                 let clonedRes = finalResponse.clone();
                 let text = await readResponseTextWithinLimit(clonedRes, MAX_REWRITE_BODY_BYTES);
@@ -6525,20 +6649,7 @@ export default {
         }
 
         // 静态资源缓存控制：使用 UHD 修复的 isStaticPath 和 hasAuthLikeState
-        const isStaticRes = isStaticPath(url.pathname);
-        const contentType = responseHeaders.get("content-type") || "";
-        const canCacheStaticRes = isStaticRes
-            && enableCache
-            && !hasAuthLikeState(new Headers(request.headers), new URL(request.url))
-            && !/application\/json/i.test(contentType);
-
-        if (canCacheStaticRes) {
-            responseHeaders.set('Cache-Control', 'public, max-age=86400');
-            responseHeaders.delete('Expires');
-            responseHeaders.delete('Pragma');
-        } else {
-            responseHeaders.set('Cache-Control', 'no-store');
-        }
+        applyProxyCacheHeaders(responseHeaders, request, url.pathname, enableCache);
 
         return new Response(finalResponse.body, { status: finalResponse.status, statusText: finalResponse.statusText, headers: responseHeaders });
     }
