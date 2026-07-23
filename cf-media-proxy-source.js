@@ -1,6 +1,6 @@
-// VERSION: 2.1.1.1
+// VERSION: 2.1.1.2
 // 🟢 面板核心配置区 (放在最顶端方便修改)
-const CURRENT_VERSION = "2.1.1.1";
+const CURRENT_VERSION = "2.1.1.2";
 const GITHUB_RAW_URL = "https://raw.githubusercontent.com/azxcvjj/cf-media-proxy/main/cf-media-proxy.js";
 
 // ==========================================
@@ -43,12 +43,70 @@ const ROUTE_CACHE_TTL_MS = 30 * 1000;
 const SETTINGS_CACHE_TTL_MS = 30 * 1000;
 const GRAPHQL_TRAFFIC_CACHE_TTL_MS = 5 * 60 * 1000;
 const PLAY_SESSION_DEDUPE_TTL_MS = 60 * 1000;
+const DEFAULT_MEMORY_CACHE_MAX_ENTRIES = 256;
+const MAX_PLAY_SESSION_CACHE_ENTRIES = 5000;
+const SIGNED_PROXY_PATH_SEGMENT = '__signed_proxy__';
 
 const ROUTE_BY_PREFIX_CACHE = new Map();
 const GENERAL_PROXY_ENABLED_CACHE = new Map();
 const CF_TOTAL_TRAFFIC_CACHE = new Map();
 const CF_PREFIX_TRAFFIC_CACHE = new Map();
 const PLAY_SESSION_DEDUPE_CACHE = new Map();
+const PROXY_SIGNING_KEY_CACHE = new Map();
+let memoryCacheWriteCount = 0;
+let databaseSchemaInitPromise = null;
+
+async function getProxySigningKey(secret) {
+    const normalizedSecret = String(secret || '');
+    if (!normalizedSecret) throw new Error('代理签名密钥未配置');
+    if (PROXY_SIGNING_KEY_CACHE.has(normalizedSecret)) return PROXY_SIGNING_KEY_CACHE.get(normalizedSecret);
+    const key = await crypto.subtle.importKey(
+        'raw',
+        new TextEncoder().encode(normalizedSecret),
+        { name: 'HMAC', hash: 'SHA-256' },
+        false,
+        ['sign', 'verify']
+    );
+    while (PROXY_SIGNING_KEY_CACHE.size >= 4) {
+        PROXY_SIGNING_KEY_CACHE.delete(PROXY_SIGNING_KEY_CACHE.keys().next().value);
+    }
+    PROXY_SIGNING_KEY_CACHE.set(normalizedSecret, key);
+    return key;
+}
+
+function toBase64Url(bytes) {
+    let binary = '';
+    for (const byte of bytes) binary += String.fromCharCode(byte);
+    return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+
+function fromBase64Url(value) {
+    if (!/^[A-Za-z0-9_-]{43}$/.test(value || '')) return null;
+    try {
+        const padded = value.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - value.length % 4) % 4);
+        const binary = atob(padded);
+        return Uint8Array.from(binary, char => char.charCodeAt(0));
+    } catch (e) {
+        return null;
+    }
+}
+
+function buildProxySignaturePayload(prefix, origin) {
+    return new TextEncoder().encode(`${String(prefix || '')}\n${String(origin || '')}`);
+}
+
+async function signProxyOrigin(secret, prefix, origin) {
+    const key = await getProxySigningKey(secret);
+    const signature = await crypto.subtle.sign('HMAC', key, buildProxySignaturePayload(prefix, origin));
+    return toBase64Url(new Uint8Array(signature));
+}
+
+async function verifyProxyOriginSignature(secret, prefix, origin, signature) {
+    const signatureBytes = fromBase64Url(signature);
+    if (!signatureBytes) return false;
+    const key = await getProxySigningKey(secret);
+    return crypto.subtle.verify('HMAC', key, signatureBytes, buildProxySignaturePayload(prefix, origin));
+}
 
 function getMemoryCache(cache, key) {
     const hit = cache.get(key);
@@ -60,7 +118,24 @@ function getMemoryCache(cache, key) {
     return hit.value;
 }
 
-function setMemoryCache(cache, key, value, ttlMs) {
+function pruneMemoryCache(cache, maxEntries) {
+    const now = Date.now();
+    for (const [cacheKey, entry] of cache) {
+        if (!entry || entry.expiresAt <= now) cache.delete(cacheKey);
+    }
+    while (cache.size >= maxEntries) {
+        const oldestKey = cache.keys().next().value;
+        if (oldestKey === undefined) break;
+        cache.delete(oldestKey);
+    }
+}
+
+function setMemoryCache(cache, key, value, ttlMs, maxEntries = DEFAULT_MEMORY_CACHE_MAX_ENTRIES) {
+    memoryCacheWriteCount++;
+    if (cache.size >= maxEntries || memoryCacheWriteCount % 64 === 0) {
+        pruneMemoryCache(cache, maxEntries);
+    }
+    cache.delete(key);
     cache.set(key, { value, expiresAt: Date.now() + ttlMs });
     return value;
 }
@@ -75,7 +150,7 @@ function buildPlaySessionDedupeKey(prefix, ip, ua) {
 function shouldRecordPlaySession(prefix, ip, ua) {
     const key = buildPlaySessionDedupeKey(prefix, ip, ua);
     if (getMemoryCache(PLAY_SESSION_DEDUPE_CACHE, key)) return false;
-    setMemoryCache(PLAY_SESSION_DEDUPE_CACHE, key, true, PLAY_SESSION_DEDUPE_TTL_MS);
+    setMemoryCache(PLAY_SESSION_DEDUPE_CACHE, key, true, PLAY_SESSION_DEDUPE_TTL_MS, MAX_PLAY_SESSION_CACHE_ENTRIES);
     return true;
 }
 
@@ -257,9 +332,11 @@ function logError(context, error, details = {}) {
 // 返回 Map<prefix, bytes>
 async function queryTrafficByPrefixes(env, routes, startISO, endISO, batchSize = 10) {
     const bytesMap = new Map(routes.map(r => [r.prefix, 0]));
+    const successfulPrefixes = new Set();
     const batchTimeoutMs = 2500;
     const totalBudgetMs = 8000;
     const deadline = Date.now() + totalBudgetMs;
+    let complete = true;
     
     // 分批查询避免 GraphQL 复杂度限制
     const batches = [];
@@ -270,6 +347,7 @@ async function queryTrafficByPrefixes(env, routes, startISO, endISO, batchSize =
     for (const batch of batches) {
         if (Date.now() > deadline) {
             console.warn('GraphQL query budget exceeded, return partial traffic data.');
+            complete = false;
             break;
         }
         const prefixLike = batch.map(r => `{clientRequestPath_like:${JSON.stringify('/' + r.prefix + '%')}}`).join(',');
@@ -305,22 +383,36 @@ async function queryTrafficByPrefixes(env, routes, startISO, endISO, batchSize =
             });
 
             const cfData = await cfRes.json();
-            if (cfData.errors && cfData.errors.length > 0) {
-                console.error(formatCloudflareApiError(cfData.errors, cfRes.status, '查询 Cloudflare GraphQL 流量'));
+            if (!cfRes.ok) {
+                complete = false;
+                console.error(formatCloudflareApiError(cfData.errors || cfData, cfRes.status, '查询 Cloudflare GraphQL 流量'));
                 continue;
             }
-            const groups = cfData?.data?.viewer?.zones?.[0]?.httpRequestsAdaptiveGroups || [];
+            if (cfData.errors && cfData.errors.length > 0) {
+                console.error(formatCloudflareApiError(cfData.errors, cfRes.status, '查询 Cloudflare GraphQL 流量'));
+                complete = false;
+                continue;
+            }
+            const groups = cfData?.data?.viewer?.zones?.[0]?.httpRequestsAdaptiveGroups;
+            if (!Array.isArray(groups)) {
+                complete = false;
+                console.error('Cloudflare GraphQL traffic response is missing the expected data array.');
+                continue;
+            }
 
             groups.forEach(g => {
                 const path = g.dimensions?.clientRequestPath || '';
                 const bytes = g.sum?.edgeResponseBytes || 0;
-                routes.forEach(r => {
-                    if (path.startsWith('/' + r.prefix)) {
+                batch.forEach(r => {
+                    const routeBase = '/' + r.prefix;
+                    if (path === routeBase || path.startsWith(routeBase + '/')) {
                         bytesMap.set(r.prefix, (bytesMap.get(r.prefix) || 0) + bytes);
                     }
                 });
             });
+            batch.forEach(r => successfulPrefixes.add(r.prefix));
         } catch(e) {
+            complete = false;
             if (e && e.name === 'AbortError') {
                 console.error('GraphQL query timeout, skip this batch.');
             } else {
@@ -331,7 +423,10 @@ async function queryTrafficByPrefixes(env, routes, startISO, endISO, batchSize =
         }
     }
 
-    return bytesMap;
+    const unavailablePrefixes = new Set(
+        routes.map(r => r.prefix).filter(prefix => !successfulPrefixes.has(prefix))
+    );
+    return { bytesMap, complete, unavailablePrefixes };
 }
 
 function buildPrefixTrafficCacheKey(env, routes, startISO) {
@@ -342,11 +437,17 @@ function buildPrefixTrafficCacheKey(env, routes, startISO) {
 async function queryTrafficByPrefixesCached(env, routes, startISO, endISO, batchSize = 10) {
     const key = buildPrefixTrafficCacheKey(env, routes, startISO);
     const cached = getMemoryCache(CF_PREFIX_TRAFFIC_CACHE, key);
-    if (cached instanceof Map) return new Map(cached);
+    if (cached instanceof Map) {
+        return {
+            bytesMap: new Map(cached),
+            complete: true,
+            unavailablePrefixes: new Set()
+        };
+    }
 
-    const bytesMap = await queryTrafficByPrefixes(env, routes, startISO, endISO, batchSize);
-    setMemoryCache(CF_PREFIX_TRAFFIC_CACHE, key, new Map(bytesMap), GRAPHQL_TRAFFIC_CACHE_TTL_MS);
-    return bytesMap;
+    const result = await queryTrafficByPrefixes(env, routes, startISO, endISO, batchSize);
+    if (result.complete) setMemoryCache(CF_PREFIX_TRAFFIC_CACHE, key, new Map(result.bytesMap), GRAPHQL_TRAFFIC_CACHE_TTL_MS);
+    return result;
 }
 
 function isValidRoutePrefix(prefix) {
@@ -357,13 +458,15 @@ function isValidRouteMode(mode) {
     return ['off', 'realip_only', 'dual', 'strict'].includes(mode);
 }
 
-function normalizeHttpUrl(value) {
+function normalizeHttpUrl(value, options = {}) {
     if (typeof value !== 'string') return null;
     const trimmed = value.trim().replace(/\/+$/g, '');
     if (!trimmed) return null;
     try {
         const parsed = new URL(trimmed);
         if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+        if (parsed.username || parsed.password) return null;
+        if (!options.allowSearch && parsed.search) return null;
         parsed.hash = '';
         return parsed.toString().replace(/\/+$/g, '');
     } catch(e) {
@@ -383,13 +486,18 @@ function validateRouteInput(data, options = {}) {
         return { ok: false, error: 'oldPrefix 格式无效' };
     }
 
-    const targets = String(data?.target || '').split(',').map(normalizeHttpUrl).filter(Boolean);
-    if (targets.length === 0) {
+    const rawTargets = String(data?.target || '').split(',').map(value => value.trim()).filter(Boolean);
+    if (rawTargets.length === 0) {
         return { ok: false, error: '至少需要一个 http/https 源站地址' };
     }
-    if (targets.length > 8) {
+    if (rawTargets.length > 8) {
         return { ok: false, error: '单个节点最多允许 8 条源站线路' };
     }
+    const normalizedTargets = rawTargets.map(value => normalizeHttpUrl(value));
+    if (normalizedTargets.some(value => !value)) {
+        return { ok: false, error: '源站地址必须是无账号信息、无查询参数的 http/https 基础 URL' };
+    }
+    const targets = Array.from(new Set(normalizedTargets));
 
     const mode = String(data?.mode || 'off');
     if (!isValidRouteMode(mode)) {
@@ -397,7 +505,7 @@ function validateRouteInput(data, options = {}) {
     }
 
     const remark = String(data?.remark || '').trim().slice(0, 128);
-    const icon = data?.icon ? normalizeHttpUrl(String(data.icon)) : '';
+    const icon = data?.icon ? normalizeHttpUrl(String(data.icon), { allowSearch: true }) : '';
     if (data?.icon && !icon) {
         return { ok: false, error: '图标地址必须是 http/https URL' };
     }
@@ -516,6 +624,13 @@ function sanitizeExternalDnsItems(values, limit = 15) {
     return result;
 }
 
+function cancelReadableQuietly(readable) {
+    try {
+        const cancellation = readable?.cancel();
+        if (cancellation && typeof cancellation.catch === 'function') cancellation.catch(() => {});
+    } catch (e) {}
+}
+
 async function readStreamTextWithinLimit(stream, maxBytes) {
     if (!stream) return '';
     const reader = stream.getReader();
@@ -527,6 +642,7 @@ async function readStreamTextWithinLimit(stream, maxBytes) {
         if (done) break;
         bytes += value.byteLength;
         if (bytes > maxBytes) {
+            cancelReadableQuietly(reader);
             throw new Error(`响应体超过 ${Math.round(maxBytes / 1024 / 1024)}MB，跳过重写以保护 Worker 内存`);
         }
         text += decoder.decode(value, { stream: true });
@@ -538,6 +654,7 @@ async function readStreamTextWithinLimit(stream, maxBytes) {
 async function readResponseTextWithinLimit(response, maxBytes = MAX_REWRITE_BODY_BYTES) {
     const length = Number(response.headers.get('content-length') || 0);
     if (length > maxBytes) {
+        cancelReadableQuietly(response.body);
         throw new Error(`响应体超过 ${Math.round(maxBytes / 1024 / 1024)}MB，跳过重写以保护 Worker 内存`);
     }
     return readStreamTextWithinLimit(response.body, maxBytes);
@@ -546,6 +663,7 @@ async function readResponseTextWithinLimit(response, maxBytes = MAX_REWRITE_BODY
 async function readRequestArrayBufferWithinLimit(request, maxBytes = MAX_REPLAY_BODY_BYTES) {
     const length = Number(request.headers.get('content-length') || 0);
     if (length > maxBytes) {
+        cancelReadableQuietly(request.body);
         throw new Error(`请求体超过 ${Math.round(maxBytes / 1024 / 1024)}MB，无法安全重试`);
     }
     const reader = request.body?.getReader();
@@ -557,6 +675,7 @@ async function readRequestArrayBufferWithinLimit(request, maxBytes = MAX_REPLAY_
         if (done) break;
         bytes += value.byteLength;
         if (bytes > maxBytes) {
+            cancelReadableQuietly(reader);
             throw new Error(`请求体超过 ${Math.round(maxBytes / 1024 / 1024)}MB，无法安全重试`);
         }
         chunks.push(value);
@@ -1900,17 +2019,29 @@ const LOGIN_UI = `
         </div>
         <div class="version-tag">v${CURRENT_VERSION}</div>
     </div>
-    <script>
+    <script nonce="__CSP_NONCE__">
         function showToast(msg) {
             const t = document.getElementById('toast');
             t.textContent = msg; t.classList.add('show');
             setTimeout(() => t.classList.remove('show'), 2000);
         }
-        function login() {
+        async function login() {
             const token = document.getElementById('tokenInput').value.trim();
             if(!token) return showToast('请输入正确的密钥');
-            document.cookie = 'admin_token=' + encodeURIComponent(token) + '; path=/; max-age=2592000; Secure; SameSite=Strict';
-            window.location.reload();
+            try {
+                const response = await fetch('/api/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ token })
+                });
+                if (!response.ok) {
+                    showToast(response.status === 401 ? '密钥验证失败' : '登录请求失败');
+                    return;
+                }
+                window.location.reload();
+            } catch (e) {
+                showToast('网络异常，请稍后重试');
+            }
         }
     </script>
 </body>
@@ -1926,9 +2057,9 @@ const HTML_UI = `
     <link rel="icon" href="https://ghfast.top/https://raw.githubusercontent.com/ginibond/ginibond/main/Icons/emby/Emby1.png" type="image/x-icon">
     <title>Emby反代面板</title>
     <style>${CSS_COMMON}</style>
-    <script src="https://cdn.jsdelivr.net/npm/sortablejs@latest/Sortable.min.js"></script>
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flag-icons@6.6.6/css/flag-icons.min.css">
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script nonce="__CSP_NONCE__" src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.6/Sortable.min.js" integrity="sha384-HZZ/fukV+9G8gwTNjN7zQDG0Sp7MsZy5DDN6VfY3Be7V9dvQpEpR2jF2HlyFUUjU" crossorigin="anonymous"></script>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flag-icons@6.6.6/css/flag-icons.min.css" integrity="sha384-TeDUCuZ+Uyp1Vv0n275nnm//ANAlP5GFHCnSF4iiAdrYmBZMM6syYgykpq4kGTqL" crossorigin="anonymous">
+    <script nonce="__CSP_NONCE__" src="https://cdn.jsdelivr.net/npm/chart.js@4.4.9/dist/chart.umd.min.js" integrity="sha384-b0GXujLkk9eYYSmcSfoyZbfyElGAQnDyY0skCHSG6w3JgTMFnz11ggrTAr7seu9f" crossorigin="anonymous"></script>
 </head>
 <body>
     <div id="toast"></div>
@@ -2362,7 +2493,7 @@ const HTML_UI = `
         </div>
     </div>
 
-    <script>
+    <script nonce="__CSP_NONCE__">
         // SVG 图标常量（内联避免作用域问题）
         const SVG_MOON = '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 3c-4.97 0-9 4.03-9 9s4.03 9 9 9 9-4.03 9-9c0-.46-.04-.92-.1-1.36-.98 1.37-2.58 2.26-4.4 2.26-2.98 0-5.4-2.42-5.4-5.4 0-1.81.89-3.42 2.26-4.4-.44-.06-.9-.1-1.36-.1z"/></svg>';
         const SVG_SUN = '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M6.76 4.84l-1.8-1.79-1.41 1.41 1.79 1.79 1.42-1.41zM4 10.5H1v2h3v-2zm9-9.95h-2V3.5h2V.55zm7.45 3.91l-1.41-1.41-1.79 1.79 1.41 1.41 1.79-1.79zm-3.21 13.7l1.79 1.8 1.41-1.41-1.8-1.79-1.4 1.4zM20 10.5v2h3v-2h-3zm-8-5c-3.31 0-6 2.69-6 6s2.69 6 6 6 6-2.69 6-6-2.69-6-6-6zm-1 16.95h2V19.5h-2v2.95zm-7.45-3.91l1.41 1.41 1.79-1.8-1.41-1.41-1.79 1.8z"/></svg>';
@@ -3190,7 +3321,9 @@ const HTML_UI = `
                             if (prefix) items.push({ prefix: prefix, sort_order: index });
                         });
                         try {
-                            await fetch('/api/routes/reorder', { method: 'POST', body: JSON.stringify(items) });
+                            const res = await fetch('/api/routes/reorder', { method: 'POST', body: JSON.stringify(items) });
+                            const result = await res.json().catch(() => null);
+                            if (!res.ok || !result?.success) throw new Error(result?.error || '排序保存失败');
                             showToast('✅ 排序已保存');
                         } catch(e) { showToast('❌ 排序保存失败'); }
                     }
@@ -3574,9 +3707,12 @@ const HTML_UI = `
             } catch (e) { document.getElementById('dnsStatus').innerHTML = '<span class="badge" style="background:rgba(255,59,48,0.1);color:#ff3b30;">网络异常</span>'; }
         }
         
-        function logout() {
-            document.cookie = "admin_token=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;";
-            window.location.reload();
+        async function logout() {
+            try {
+                await fetch('/api/logout', { method: 'POST' });
+            } finally {
+                window.location.reload();
+            }
         }
 
         // 初始化加载
@@ -3980,12 +4116,39 @@ const HTML_UI = `
 </html>
 `;
 
+function createPanelHtmlResponse(html, status = 200) {
+    const nonceBytes = new Uint8Array(16);
+    crypto.getRandomValues(nonceBytes);
+    const nonce = btoa(String.fromCharCode(...nonceBytes));
+    const headers = new Headers({
+        "Content-Type": "text/html;charset=UTF-8",
+        "Cache-Control": "no-store",
+        "X-Content-Type-Options": "nosniff",
+        "Referrer-Policy": "no-referrer",
+        "Content-Security-Policy": [
+            "default-src 'self'",
+            `script-src 'nonce-${nonce}' 'strict-dynamic' https://cdn.jsdelivr.net`,
+            "script-src-attr 'unsafe-inline'",
+            "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net",
+            "img-src 'self' data: https:",
+            "font-src 'self' data: https://cdn.jsdelivr.net",
+            "connect-src 'self' https:",
+            "object-src 'none'",
+            "base-uri 'none'",
+            "frame-ancestors 'none'",
+            "form-action 'self'"
+        ].join("; ")
+    });
+    return new Response(html.replaceAll("__CSP_NONCE__", nonce), { status, headers });
+}
+
 // ==========================================
 // 2. 后端 Worker 主逻辑处理区 (核心故障转移 + TG Bot播报 + 智能流量拉取)
 // ==========================================
 
 async function getCFTrafficBytes(env, type) {
     if (!env.CF_API_TOKEN || !env.CF_ZONE_ID) return "缺少变量";
+    let timeoutId = null;
     try {
         const end = new Date();
         let graphqlQuery = {};
@@ -4020,7 +4183,8 @@ async function getCFTrafficBytes(env, type) {
             };
         } else {
             // 【7天、30天】查询：传入数字代表天数，使用 1dGroups
-            const start = new Date(end.getTime() - type * 24 * 3600000);
+            const dayCount = Math.max(1, Math.floor(Number(type)) || 1);
+            const start = new Date(end.getTime() - (dayCount - 1) * 24 * 3600000);
             const dateGeq = start.toISOString().split('T')[0];
             const dateLeq = end.toISOString().split('T')[0];
             graphqlQuery = {
@@ -4045,17 +4209,25 @@ async function getCFTrafficBytes(env, type) {
             };
         }
 
+        const controller = new AbortController();
+        timeoutId = setTimeout(() => controller.abort(), 2500);
+
         const cfRes = await fetch('https://api.cloudflare.com/client/v4/graphql', {
             method: 'POST',
             headers: { 
                 'Authorization': `Bearer ${env.CF_API_TOKEN}`,
                 'Content-Type': 'application/json'
             },
-            body: JSON.stringify(graphqlQuery)
+            body: JSON.stringify(graphqlQuery),
+            signal: controller.signal
         });
         
         const cfData = await cfRes.json();
         
+        if (!cfRes.ok) {
+            return formatCloudflareApiError(cfData.errors || cfData, cfRes.status, '查询 Cloudflare Analytics');
+        }
+
         if (cfData.errors && cfData.errors.length > 0) {
             return formatCloudflareApiError(cfData.errors, cfRes.status, '查询 Cloudflare Analytics');
         }
@@ -4074,7 +4246,10 @@ async function getCFTrafficBytes(env, type) {
 
         return totalBytes;
     } catch(e) {
+        if (e && e.name === 'AbortError') return "请求超时";
         return "请求异常";
+    } finally {
+        if (timeoutId !== null) clearTimeout(timeoutId);
     }
 }
 
@@ -4104,12 +4279,55 @@ function clearRoutesCache(prefix = null) {
     }
     ROUTE_BY_PREFIX_CACHE.clear();
 }
+async function ensureDatabaseSchema(env) {
+    if (!env.DB) return;
+    if (!databaseSchemaInitPromise) {
+        databaseSchemaInitPromise = (async () => {
+            await env.DB.exec('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)');
+            await env.DB.exec("CREATE TABLE IF NOT EXISTS routes (prefix TEXT PRIMARY KEY, target TEXT NOT NULL, mode TEXT DEFAULT 'off', remark TEXT DEFAULT '', last_play TEXT DEFAULT '', icon TEXT DEFAULT '', cache_img TEXT DEFAULT 'on', sort_order INTEGER DEFAULT 0)");
+            await env.DB.exec('CREATE TABLE IF NOT EXISTS request_stats (prefix TEXT, date TEXT, count INTEGER DEFAULT 0, PRIMARY KEY(prefix, date))');
+            await env.DB.exec("CREATE TABLE IF NOT EXISTS visitor_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, prefix TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP, ip TEXT, country TEXT, city TEXT DEFAULT '', ua TEXT)");
+            await env.DB.exec('CREATE INDEX IF NOT EXISTS idx_visitor_logs_country ON visitor_logs(country)');
+            await env.DB.exec('CREATE INDEX IF NOT EXISTS idx_visitor_logs_timestamp ON visitor_logs(timestamp)');
+
+            const [routeColumnResult, visitorColumnResult] = await Promise.all([
+                env.DB.prepare('PRAGMA table_info(routes)').all(),
+                env.DB.prepare('PRAGMA table_info(visitor_logs)').all()
+            ]);
+            const routeColumns = new Set((routeColumnResult.results || []).map(row => row.name));
+            const visitorColumns = new Set((visitorColumnResult.results || []).map(row => row.name));
+            const migrations = [
+                [visitorColumns, 'city', "ALTER TABLE visitor_logs ADD COLUMN city TEXT DEFAULT ''"],
+                [routeColumns, 'mode', "ALTER TABLE routes ADD COLUMN mode TEXT DEFAULT 'off'"],
+                [routeColumns, 'remark', "ALTER TABLE routes ADD COLUMN remark TEXT DEFAULT ''"],
+                [routeColumns, 'last_play', "ALTER TABLE routes ADD COLUMN last_play TEXT DEFAULT ''"],
+                [routeColumns, 'icon', "ALTER TABLE routes ADD COLUMN icon TEXT DEFAULT ''"],
+                [routeColumns, 'cache_img', "ALTER TABLE routes ADD COLUMN cache_img TEXT DEFAULT 'on'"],
+                [routeColumns, 'sort_order', 'ALTER TABLE routes ADD COLUMN sort_order INTEGER DEFAULT 0']
+            ];
+            for (const [columns, name, sql] of migrations) {
+                if (columns.has(name)) continue;
+                try {
+                    await env.DB.exec(sql);
+                } catch (error) {
+                    if (!/duplicate column name/i.test(String(error?.message || error))) throw error;
+                }
+            }
+        })().catch(error => {
+            databaseSchemaInitPromise = null;
+            throw error;
+        });
+    }
+    return databaseSchemaInitPromise;
+}
+
 
 async function getCachedRouteByPrefix(env, prefix) {
     const cached = getMemoryCache(ROUTE_BY_PREFIX_CACHE, prefix);
     if (cached !== undefined) return cached;
     if (!env.DB) return null;
 
+    await ensureDatabaseSchema(env);
     const route = await env.DB.prepare(`SELECT target, mode, cache_img FROM routes WHERE prefix = ?`).bind(prefix).first();
     setMemoryCache(ROUTE_BY_PREFIX_CACHE, prefix, route || null, ROUTE_CACHE_TTL_MS);
     return route || null;
@@ -4126,18 +4344,20 @@ async function getGeneralProxyEnabledCached(env) {
     let enabled = ALLOW_GENERAL_PROXY;
     if (env.DB) {
         try {
-            await env.DB.exec(`CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)`);
+            await ensureDatabaseSchema(env);
             const result = await env.DB.prepare('SELECT value FROM settings WHERE key = ?').bind('general_proxy_enabled').first();
             if (result && result.value !== null) enabled = result.value === 'true';
         } catch(e) {
-            console.error('D1读取通用反代状态失败，使用默认值:', e);
+            console.error('D1读取通用反代状态失败，临时关闭通用反代:', e);
+            return false;
         }
     } else if (env.SETTINGS) {
         try {
             const kvValue = await env.SETTINGS.get('general_proxy_enabled');
             if (kvValue !== null) enabled = kvValue === 'true';
         } catch(e) {
-            console.error('KV读取通用反代状态失败，使用默认值:', e);
+            console.error('KV读取通用反代状态失败，临时关闭通用反代:', e);
+            return false;
         }
     }
     return setGeneralProxyEnabledCache(enabled);
@@ -4438,17 +4658,28 @@ async function probeNodeLatency(target, timeoutMs = 2000) {
     }
 }
 
-async function callTelegramApi(env, method, payload) {
-    const response = await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/${method}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-    });
-    const data = await response.json().catch(() => null);
-    if (!response.ok || !data?.ok) {
-        throw new Error(data?.description || `Telegram API ${method} failed`);
+async function callTelegramApi(env, method, payload, timeoutMs = 8000) {
+    const controller = new AbortController();
+    let timeoutId = null;
+    try {
+        timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+        const response = await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/${method}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+            signal: controller.signal
+        });
+        const data = await response.json().catch(() => null);
+        if (!response.ok || !data?.ok) {
+            throw new Error(data?.description || `Telegram API ${method} failed`);
+        }
+        return data;
+    } catch (error) {
+        if (error?.name === 'AbortError') throw new Error(`Telegram API ${method} 请求超时`);
+        throw error;
+    } finally {
+        if (timeoutId !== null) clearTimeout(timeoutId);
     }
-    return data;
 }
 
 async function answerTgCallback(env, callbackQueryId, text = '') {
@@ -4543,6 +4774,7 @@ async function sendTgNodeStatus(env, chatId, messageId = null, page = 1, proxyOr
             await sendTgMessage(env, chatId, '❌ 数据库未绑定');
             return;
         }
+        await ensureDatabaseSchema(env);
 
         const routes = await env.DB.prepare(`SELECT prefix, remark, target, mode, last_play FROM routes ORDER BY sort_order ASC, prefix ASC`).all();
         if (!routes?.results?.length) {
@@ -4587,11 +4819,12 @@ async function sendTgVisitorDetail(env, chatId, messageId = null) {
             await sendTgMessage(env, chatId, '❌ 数据库未绑定');
             return;
         }
+        await ensureDatabaseSchema(env);
 
         // 使用全局 DATE_FILTER_CST（北京时间当天）
         const [todayQuery, weekQuery, topUasQuery, topPathsQuery] = await Promise.all([
             env.DB.prepare(`SELECT COUNT(*) as c FROM visitor_logs WHERE ${DATE_FILTER_CST}`).first(),
-            env.DB.prepare(`SELECT COUNT(*) as c FROM visitor_logs WHERE timestamp >= datetime('now', '-7 days', '+8 hours')`).first(),
+            env.DB.prepare(`SELECT COUNT(*) as c FROM visitor_logs WHERE ${DATE_FILTER_7D}`).first(),
             env.DB.prepare(`SELECT ua, COUNT(*) as c FROM visitor_logs WHERE ${DATE_FILTER_CST} AND ua != 'Unknown' GROUP BY ua ORDER BY c DESC LIMIT 5`).all(),
             env.DB.prepare(`
                 SELECT r.remark, COUNT(v.id) as c
@@ -4613,14 +4846,14 @@ async function sendTgVisitorDetail(env, chatId, messageId = null) {
                 const icon = r.ua?.toLowerCase().includes('emby') ? '📺' :
                              r.ua?.toLowerCase().includes('jellyfin') ? '🎬' :
                              r.ua?.toLowerCase().includes('chrome') ? '🌐' : '📱';
-                const name = r.ua?.length > 30 ? r.ua.substring(0, 30) + '...' : r.ua;
+                const name = escapeTelegramHtml(r.ua?.length > 30 ? r.ua.substring(0, 30) + '...' : r.ua);
                 return `│ ${i + 1}. ${icon} ${name}   ${r.c}次`;
             }).join('\n')
             : '│ 暂无记录';
 
         // Top paths - 使用可选链简化判断
         const pathLines = topPathsQuery?.results?.length > 0
-            ? topPathsQuery.results.map((r, i) => `│ ${i + 1}. ${r.remark || r.prefix}   ${r.c}次`).join('\n')
+            ? topPathsQuery.results.map((r, i) => `│ ${i + 1}. ${escapeTelegramHtml(r.remark || r.prefix)}   ${r.c}次`).join('\n')
             : '│ 暂无记录';
 
         const now = Date.now();
@@ -4645,16 +4878,12 @@ async function sendTgVisitorDetail(env, chatId, messageId = null) {
         const keyboard = [[{ text: '🔙 返回统计', callback_data: 'back_to_stats' }]];
 
         if (messageId) {
-            await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/editMessageCaption`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    chat_id: chatId,
-                    message_id: messageId,
-                    caption: msg,
-                    parse_mode: 'HTML',
-                    reply_markup: JSON.stringify({ inline_keyboard: keyboard })
-                })
+            await callTelegramApi(env, 'editMessageCaption', {
+                chat_id: chatId,
+                message_id: messageId,
+                caption: msg,
+                parse_mode: 'HTML',
+                reply_markup: JSON.stringify({ inline_keyboard: keyboard })
             });
         } else {
             await sendTgMessage(env, chatId, msg, null, keyboard);
@@ -4667,8 +4896,10 @@ async function sendTgVisitorDetail(env, chatId, messageId = null) {
 // 用于生成 TG 播报消息的核心工具函数 (单面板 + 流量之王统计版 + 客户端软件统计版)
 async function sendTgStats(env, chatId, messageId = null) {
     try {
+        if (!env.DB) return;
+        await ensureDatabaseSchema(env);
         // 使用 Promise.all 并行查询，提高性能
-        const DATE_FILTER_YEST = `timestamp >= datetime('now', '-48 hours', '+8 hours') AND timestamp < datetime('now', '-24 hours', '+8 hours')`;
+        const DATE_FILTER_YEST = "date(timestamp, '+8 hours') = date('now', '+8 hours', '-1 day')";
 
         const [totalQuery, yesterdayQuery, topRegionQuery, topNodeQuery, topClientQuery, workerColoStatus, routesQuery] = await Promise.all([
             env.DB.prepare(`SELECT COUNT(*) as count FROM visitor_logs WHERE ${DATE_FILTER_CST}`).first(),
@@ -4718,7 +4949,7 @@ async function sendTgStats(env, chatId, messageId = null) {
                 .slice(0, 5)
                 .map(([name, count], i) => {
                     const rankEmoji = ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣'][i];
-                    return `│ ${rankEmoji} ${getClientIcon(name)} ${name} · ${count}次`;
+                    return `│ ${rankEmoji} ${getClientIcon(name)} ${escapeTelegramHtml(name)} · ${count}次`;
                 }).join('\n');
         }
         
@@ -4733,6 +4964,7 @@ async function sendTgStats(env, chatId, messageId = null) {
         const traffic30d = typeof traffic30dRaw === 'number' ? (traffic30dRaw === 0 ? '0 B' : formatBytes(traffic30dRaw)) : traffic30dRaw;
 
         let bytesByRoute = new Map();
+        let unavailableTrafficPrefixes = new Set();
         if (env.CF_API_TOKEN && env.CF_ZONE_ID && env.DB) {
             try {
                 const routes = routesQuery?.results || [];
@@ -4744,10 +4976,13 @@ async function sendTgStats(env, chatId, messageId = null) {
                     const endISO = end.toISOString();
                     const startISO = start.toISOString();
 
-                    bytesByRoute = await queryTrafficByPrefixesCached(env, routes, startISO, endISO);
+                    const trafficResult = await queryTrafficByPrefixesCached(env, routes, startISO, endISO);
+                    bytesByRoute = trafficResult.bytesMap;
+                    unavailableTrafficPrefixes = trafficResult.unavailablePrefixes;
                 }
             } catch (e) {
                 bytesByRoute = new Map();
+                unavailableTrafficPrefixes = new Set((routesQuery?.results || []).map(r => r.prefix));
             }
         }
 
@@ -4772,7 +5007,9 @@ async function sendTgStats(env, chatId, messageId = null) {
             ? topNodeQuery.results.map((r, i) => {
                 const rank = ['🥇', '🥈', '🥉'][i];
                 const name = truncateTelegramText(r.remark || '未命名节点', 18);
-                const trafficText = formatBytes(bytesByRoute.get(r.prefix) || 0);
+                const trafficText = unavailableTrafficPrefixes.has(r.prefix)
+                    ? '获取异常'
+                    : formatBytes(bytesByRoute.get(r.prefix) || 0);
                 return `│ ${rank} ${escapeTelegramHtml(name)} · ${r.c}次 · ${trafficText}`;
             }).join('\n')
             : '暂无记录';
@@ -4790,9 +5027,9 @@ async function sendTgStats(env, chatId, messageId = null) {
                 return '→ 接近30日均值';
             })()
             : '→ 接近30日均值';
-        const trafficTodayLine = `${trafficToday} · ${todayTrafficTrend}`;
-        const traffic7dLine = `${traffic7d} · ${weekTrafficTrend}`;
-        const traffic30dLine = `${traffic30d} · → 长周期稳定`;
+        const trafficTodayLine = `${escapeTelegramHtml(trafficToday)} · ${todayTrafficTrend}`;
+        const traffic7dLine = `${escapeTelegramHtml(traffic7d)} · ${weekTrafficTrend}`;
+        const traffic30dLine = `${escapeTelegramHtml(traffic30d)} · → 长周期稳定`;
 
         const now = new Date();
         const greeting = getGreeting();
@@ -4830,29 +5067,21 @@ async function sendTgStats(env, chatId, messageId = null) {
 
         if (messageId) {
             // 有 messageId 时用 editMessageCaption（编辑带图片消息的 caption）
-            await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/editMessageCaption`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    chat_id: chatId,
-                    message_id: messageId,
-                    caption: msg,
-                    parse_mode: 'HTML',
-                    reply_markup: replyMarkup
-                })
+            await callTelegramApi(env, 'editMessageCaption', {
+                chat_id: chatId,
+                message_id: messageId,
+                caption: msg,
+                parse_mode: 'HTML',
+                reply_markup: replyMarkup
             });
         } else {
             // 首次发送，用 sendPhoto 带随机壁纸
-            await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendPhoto`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    chat_id: chatId,
-                    photo: TOP_IMAGE_URL,
-                    caption: msg,
-                    parse_mode: 'HTML',
-                    reply_markup: replyMarkup
-                })
+            await callTelegramApi(env, 'sendPhoto', {
+                chat_id: chatId,
+                photo: TOP_IMAGE_URL,
+                caption: msg,
+                parse_mode: 'HTML',
+                reply_markup: replyMarkup
             });
         }
     } catch (e) {
@@ -4871,6 +5100,7 @@ export default {
         if (env.DB) {
             ctx.waitUntil((async () => {
                 try {
+                    await ensureDatabaseSchema(env);
                     await env.DB.exec(`DELETE FROM visitor_logs WHERE timestamp < datetime('now', '-7 days')`);
                     console.log('visitor_logs cleanup completed');
                 } catch(e) {
@@ -4882,6 +5112,8 @@ export default {
 
     async fetch(request, env, ctx) {
         const url = new URL(request.url);
+        const ADMIN_COOKIE_NAME = '__Host-admin_token';
+        const proxyOriginSignatureCache = new Map();
 
         function getCookie(req, name) {
             const cookieString = req.headers.get("Cookie");
@@ -4898,20 +5130,48 @@ export default {
         }
 
         const EXPECTED_TOKEN = env.ADMIN_TOKEN;
+        const PROXY_SIGNING_SECRET = env.PROXY_SIGNING_KEY || EXPECTED_TOKEN;
         const isPublicEndpoint = request.method === "OPTIONS"
+            || (url.pathname === '/api/login' && request.method === 'POST')
             || url.pathname === '/api/tg-webhook'
             || url.pathname === '/__client_rtt__';
         const isPanelOrApi = url.pathname === '/' || url.pathname.startsWith('/api/');
 
+        if (url.pathname === '/api/login' && request.method === 'POST') {
+            if (!EXPECTED_TOKEN) return Response.json({ success: false, error: 'ADMIN_TOKEN 未配置' }, { status: 500 });
+            try {
+                const bodyBytes = await readRequestArrayBufferWithinLimit(request, 8192);
+                const body = JSON.parse(new TextDecoder().decode(bodyBytes));
+                if (typeof body.token !== 'string' || body.token !== EXPECTED_TOKEN) {
+                    return Response.json({ success: false, error: 'Unauthorized' }, { status: 401 });
+                }
+
+                const headers = new Headers({ 'Cache-Control': 'no-store' });
+                headers.append('Set-Cookie', `${ADMIN_COOKIE_NAME}=${encodeURIComponent(EXPECTED_TOKEN)}; Path=/; Max-Age=2592000; Secure; HttpOnly; SameSite=Strict`);
+                headers.append('Set-Cookie', 'admin_token=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Strict');
+                return Response.json({ success: true }, { headers });
+            } catch (e) {
+                const status = /exceeds limit/i.test(e.message || '') ? 413 : 400;
+                return Response.json({ success: false, error: 'Invalid request' }, { status });
+            }
+        }
+
         if (!isPublicEndpoint) {
             if (!EXPECTED_TOKEN) return new Response("请在 Worker 变量中配置 ADMIN_TOKEN", { status: 500 });
             if (isPanelOrApi) {
-                const providedToken = getCookie(request, 'admin_token');
+                const providedToken = getCookie(request, ADMIN_COOKIE_NAME);
                 if (providedToken !== EXPECTED_TOKEN) {
-                    if (url.pathname === '/') return new Response(LOGIN_UI, { headers: { "Content-Type": "text/html;charset=UTF-8" } });
+                    if (url.pathname === '/') return createPanelHtmlResponse(LOGIN_UI, 401);
                     return new Response('Unauthorized', { status: 401 });
                 }
             }
+        }
+
+        if (url.pathname === '/api/logout' && request.method === 'POST') {
+            const headers = new Headers({ 'Cache-Control': 'no-store' });
+            headers.append('Set-Cookie', `${ADMIN_COOKIE_NAME}=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Strict`);
+            headers.append('Set-Cookie', 'admin_token=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Strict');
+            return Response.json({ success: true }, { headers });
         }
 
         // ==========================================
@@ -5020,7 +5280,7 @@ export default {
                 // 优先保存到 D1 数据库（更可靠）
                 if (env.DB) {
                     try {
-                        await env.DB.exec(`CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)`);
+                        await ensureDatabaseSchema(env);
                         await env.DB.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)').bind('general_proxy_enabled', enabled.toString()).run();
                     } catch(e) {
                         console.error('D1保存失败:', e);
@@ -5083,6 +5343,11 @@ export default {
 
         // Telegram Webhook 拦截
         if (url.pathname === '/api/tg-webhook' && request.method === 'POST') {
+            const webhookSecret = String(env.TG_WEBHOOK_SECRET || '').trim();
+            const providedWebhookSecret = request.headers.get('X-Telegram-Bot-Api-Secret-Token') || '';
+            if (webhookSecret && providedWebhookSecret !== webhookSecret) {
+                return new Response('Unauthorized', { status: 401 });
+            }
             try {
                 const body = await request.json();
                 const senderChatId = body.message?.chat?.id || body.callback_query?.message?.chat?.id;
@@ -5102,7 +5367,7 @@ export default {
                 }
                 // 处理按钮回调
                 if (body.callback_query) {
-                    const callbackData = body.callback_query.data;
+                    const callbackData = String(body.callback_query.data || '');
                     const callbackQueryId = body.callback_query.id;
                     const chatId = body.callback_query.message.chat.id;
                     const messageId = body.callback_query.message.message_id;
@@ -5127,7 +5392,7 @@ export default {
         }
 
         if (url.pathname === '/') {
-            return new Response(HTML_UI, { headers: { "Content-Type": "text/html;charset=UTF-8" } });
+            return createPanelHtmlResponse(HTML_UI);
         }
 
         // ==========================================
@@ -5136,6 +5401,7 @@ export default {
         if (url.pathname === '/api/analytics' && request.method === 'GET') {
             if (!env.DB) return Response.json({ success: false, error: '未绑定 D1 数据库' });
             try {
+                await ensureDatabaseSchema(env);
                 // 并发获取 24小时、7天、30天流量 (通过全新 GraphQL API 规避限制)
                 const [trafficToday, traffic7d, traffic30d] = await Promise.all([
                     getCFTraffic(env, 'today'),
@@ -5439,56 +5705,70 @@ export default {
         if (url.pathname === '/api/routes/reorder' && request.method === 'POST') {
             if (!env.DB) return Response.json({ success: false, error: "未绑定 DB" });
             try {
+                await ensureDatabaseSchema(env);
                 const items = await request.json(); 
-                if (!Array.isArray(items)) return Response.json({ success: false, error: 'Invalid parameters' }, { status: 400 });
+                if (!Array.isArray(items) || items.length === 0 || items.length > 500) {
+                    return Response.json({ success: false, error: '排序项目数量必须在 1-500 条之间' }, { status: 400 });
+                }
+                const normalizedItems = [];
+                const seenPrefixes = new Set();
                 for (const item of items) {
-                    if (!isValidRoutePrefix(String(item?.prefix || '')) || !Number.isFinite(Number(item?.sort_order))) {
+                    const prefix = String(item?.prefix || '');
+                    const sortOrder = Number(item?.sort_order);
+                    if (!isValidRoutePrefix(prefix) || !Number.isInteger(sortOrder) || sortOrder < 0 || sortOrder >= 500) {
                         return Response.json({ success: false, error: 'Invalid route order item' }, { status: 400 });
                     }
+                    if (seenPrefixes.has(prefix)) continue;
+                    seenPrefixes.add(prefix);
+                    normalizedItems.push({ prefix, sort_order: sortOrder });
                 }
-                const stmts = items.map(item => env.DB.prepare('UPDATE routes SET sort_order = ? WHERE prefix = ?').bind(item.sort_order, item.prefix));
-                await env.DB.batch(stmts);
+                await env.DB.prepare(`
+                    WITH updates(prefix, sort_order) AS (
+                        SELECT json_extract(value, '$.prefix'), CAST(json_extract(value, '$.sort_order') AS INTEGER)
+                        FROM json_each(?)
+                    )
+                    UPDATE routes
+                    SET sort_order = (SELECT updates.sort_order FROM updates WHERE updates.prefix = routes.prefix)
+                    WHERE prefix IN (SELECT prefix FROM updates)
+                `).bind(JSON.stringify(normalizedItems)).run();
                 return Response.json({ success: true });
-            } catch (e) { return Response.json({ success: false, error: e.message }); }
+            } catch (e) { return Response.json({ success: false, error: e.message }, { status: 500 }); }
         }
 
         if (url.pathname === '/api/routes/import' && request.method === 'POST') {
             if (!env.DB) return Response.json({ success: false, error: "未绑定 DB" });
             try {
+                await ensureDatabaseSchema(env);
                 const routes = await request.json();
                 if (!Array.isArray(routes)) return Response.json({ success: false, error: '导入内容必须是数组' }, { status: 400 });
+                if (routes.length === 0 || routes.length > 500) return Response.json({ success: false, error: '导入配置数量必须在 1-500 条之间' }, { status: 400 });
+                const importedRoutes = [];
                 for (const [index, r] of routes.entries()) {
-                    if (r.prefix && r.target) {
-                        const validated = validateRouteInput(r);
-                        if (!validated.ok) return Response.json({ success: false, error: `第 ${index + 1} 条配置无效: ${validated.error}` }, { status: 400 });
-                        const route = validated.route;
-                        await env.DB.prepare('INSERT OR REPLACE INTO routes (prefix, target, mode, remark, last_play, icon, cache_img, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-                            .bind(route.prefix, route.target, route.mode, route.remark, route.last_play, route.icon, route.cache_img, route.sort_order).run();
-                    }
+                    const validated = validateRouteInput(r);
+                    if (!validated.ok) return Response.json({ success: false, error: `第 ${index + 1} 条配置无效: ${validated.error}` }, { status: 400 });
+                    importedRoutes.push(validated.route);
                 }
+                await env.DB.prepare(`
+                    INSERT OR REPLACE INTO routes (prefix, target, mode, remark, last_play, icon, cache_img, sort_order)
+                    SELECT
+                        json_extract(value, '$.prefix'),
+                        json_extract(value, '$.target'),
+                        json_extract(value, '$.mode'),
+                        json_extract(value, '$.remark'),
+                        json_extract(value, '$.last_play'),
+                        json_extract(value, '$.icon'),
+                        json_extract(value, '$.cache_img'),
+                        CAST(json_extract(value, '$.sort_order') AS INTEGER)
+                    FROM json_each(?)
+                `).bind(JSON.stringify(importedRoutes)).run();
+                clearRoutesCache();
                 return Response.json({ success: true });
-            } catch (e) { return Response.json({ success: false, error: e.message }); }
+            } catch (e) { return Response.json({ success: false, error: e.message }, { status: 500 }); }
         }
 
         if (url.pathname.startsWith('/api/routes')) {
             if (!env.DB) return Response.json({ error: "由于未绑定 D1 数据库，反代功能不可用。" }, { status: 500 });
-
-            await env.DB.exec(`CREATE TABLE IF NOT EXISTS routes (prefix TEXT PRIMARY KEY, target TEXT NOT NULL)`);
-            await env.DB.exec(`CREATE TABLE IF NOT EXISTS request_stats (prefix TEXT, date TEXT, count INTEGER DEFAULT 0, PRIMARY KEY(prefix, date))`);
-            // 大数据记录核心表：访客日志
-            await env.DB.exec(`CREATE TABLE IF NOT EXISTS visitor_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, prefix TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP, ip TEXT, country TEXT, city TEXT DEFAULT '', ua TEXT)`);
-            
-            // 添加索引提升查询性能
-            try { await env.DB.exec(`CREATE INDEX IF NOT EXISTS idx_visitor_logs_country ON visitor_logs(country)`); } catch(e) {}
-            try { await env.DB.exec(`CREATE INDEX IF NOT EXISTS idx_visitor_logs_timestamp ON visitor_logs(timestamp)`); } catch(e) {}
-            try { await env.DB.exec(`ALTER TABLE visitor_logs ADD COLUMN city TEXT DEFAULT ''`); } catch(e) {}
-            
-            try { await env.DB.exec(`ALTER TABLE routes ADD COLUMN mode TEXT DEFAULT 'off'`); } catch(e) {}
-            try { await env.DB.exec(`ALTER TABLE routes ADD COLUMN remark TEXT DEFAULT ''`); } catch(e) {}
-            try { await env.DB.exec(`ALTER TABLE routes ADD COLUMN last_play TEXT DEFAULT ''`); } catch(e) {}
-            try { await env.DB.exec(`ALTER TABLE routes ADD COLUMN icon TEXT DEFAULT ''`); } catch(e) {}
-            try { await env.DB.exec(`ALTER TABLE routes ADD COLUMN cache_img TEXT DEFAULT 'on'`); } catch(e) {} 
-            try { await env.DB.exec(`ALTER TABLE routes ADD COLUMN sort_order INTEGER DEFAULT 0`); } catch(e) {}
+            await ensureDatabaseSchema(env);
 
             // 数据防爆清理策略：已移至 scheduled 定时任务，每天执行一次
 
@@ -5513,11 +5793,12 @@ export default {
                     const startISO = start.toISOString();
 
                     try {
-                        const bytesMap = await queryTrafficByPrefixesCached(env, routes, startISO, endISO);
+                        const trafficResult = await queryTrafficByPrefixesCached(env, routes, startISO, endISO);
 
                         routes.forEach(r => {
-                            const bytes = bytesMap.get(r.prefix) || 0;
-                            r.todayBandwidth = formatBytes(bytes);
+                            r.todayBandwidth = trafficResult.unavailablePrefixes.has(r.prefix)
+                                ? "获取异常"
+                                : formatBytes(trafficResult.bytesMap.get(r.prefix) || 0);
                         });
                     } catch(e) {
                         routes.forEach(r => { r.todayBandwidth = "获取异常"; });
@@ -5538,17 +5819,39 @@ export default {
                 const validated = validateRouteInput(data);
                 if (!validated.ok) return Response.json({ success: false, error: validated.error }, { status: 400 });
                 const route = validated.route;
+                let lastPlay = '';
                 if (route.oldPrefix && route.oldPrefix !== route.prefix) {
-                    const oldRow = await env.DB.prepare('SELECT sort_order FROM routes WHERE prefix = ?').bind(route.oldPrefix).first();
-                    if(oldRow) currentSortOrder = oldRow.sort_order;
-                    await env.DB.prepare('DELETE FROM routes WHERE prefix = ?').bind(route.oldPrefix).run();
+                    const [oldRow, targetRow] = await Promise.all([
+                        env.DB.prepare('SELECT sort_order, last_play FROM routes WHERE prefix = ?').bind(route.oldPrefix).first(),
+                        env.DB.prepare('SELECT prefix FROM routes WHERE prefix = ?').bind(route.prefix).first()
+                    ]);
+                    if (!oldRow) return Response.json({ success: false, error: '原节点不存在，无法重命名' }, { status: 404 });
+                    if (targetRow) return Response.json({ success: false, error: '目标前缀已存在，请更换后重试' }, { status: 409 });
+                    currentSortOrder = oldRow.sort_order || 0;
+                    lastPlay = oldRow.last_play || '';
+                    await env.DB.batch([
+                        env.DB.prepare('DELETE FROM routes WHERE prefix = ?').bind(route.oldPrefix),
+                        env.DB.prepare('INSERT INTO routes (prefix, target, mode, remark, last_play, icon, cache_img, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+                            .bind(route.prefix, route.target, route.mode, route.remark, lastPlay, route.icon, route.cache_img, currentSortOrder),
+                        env.DB.prepare(`
+                            INSERT INTO request_stats (prefix, date, count)
+                            SELECT ?, date, count
+                            FROM request_stats
+                            WHERE prefix = ?
+                            ON CONFLICT(prefix, date) DO UPDATE SET count = request_stats.count + excluded.count
+                        `).bind(route.prefix, route.oldPrefix),
+                        env.DB.prepare('DELETE FROM request_stats WHERE prefix = ?').bind(route.oldPrefix),
+                        env.DB.prepare('UPDATE visitor_logs SET prefix = ? WHERE prefix = ?').bind(route.prefix, route.oldPrefix)
+                    ]);
                 } else {
-                    const oldRow = await env.DB.prepare('SELECT sort_order FROM routes WHERE prefix = ?').bind(route.prefix).first();
-                    if(oldRow) currentSortOrder = oldRow.sort_order;
+                    const oldRow = await env.DB.prepare('SELECT sort_order, last_play FROM routes WHERE prefix = ?').bind(route.prefix).first();
+                    if (oldRow) {
+                        currentSortOrder = oldRow.sort_order || 0;
+                        lastPlay = oldRow.last_play || '';
+                    }
+                    await env.DB.prepare('INSERT OR REPLACE INTO routes (prefix, target, mode, remark, last_play, icon, cache_img, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+                        .bind(route.prefix, route.target, route.mode, route.remark, lastPlay, route.icon, route.cache_img, currentSortOrder).run();
                 }
-
-                await env.DB.prepare('INSERT OR REPLACE INTO routes (prefix, target, mode, remark, icon, cache_img, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?)')
-                    .bind(route.prefix, route.target, route.mode, route.remark, route.icon, route.cache_img, currentSortOrder).run();
                 clearRoutesCache(route.prefix);
                 if (route.oldPrefix && route.oldPrefix !== route.prefix) clearRoutesCache(route.oldPrefix);
                 return Response.json({ success: true });
@@ -5562,17 +5865,21 @@ export default {
                 } catch (e) {
                     return Response.json({ success: false, error: '请求体必须是合法 JSON' }, { status: 400 });
                 }
-                if (data.prefixes && Array.isArray(data.prefixes) && data.mode !== undefined) {
-                    if (!isValidRouteMode(String(data.mode)) || data.prefixes.some(prefix => !isValidRoutePrefix(String(prefix || '')))) {
-                        return Response.json({ success: false, error: 'Invalid parameters' }, { status: 400 });
-                    }
-                    const placeholders = data.prefixes.map(() => '?').join(',');
-                    await env.DB.prepare(`UPDATE routes SET mode = ? WHERE prefix IN (${placeholders})`)
-                        .bind(data.mode, ...data.prefixes).run();
-                    clearRoutesCache();
-                    return Response.json({ success: true });
+                if (!Array.isArray(data.prefixes) || data.prefixes.length === 0 || data.prefixes.length > 500 || data.mode === undefined) {
+                    return Response.json({ success: false, error: 'Invalid parameters' }, { status: 400 });
                 }
-                return Response.json({ success: false, error: 'Invalid parameters' });
+                const mode = String(data.mode);
+                const prefixes = Array.from(new Set(data.prefixes.map(prefix => String(prefix || ''))));
+                if (prefixes.length === 0 || prefixes.length > 500 || !isValidRouteMode(mode) || prefixes.some(prefix => !isValidRoutePrefix(prefix))) {
+                    return Response.json({ success: false, error: '批量更新节点数量必须在 1-500 条之间，且参数必须有效' }, { status: 400 });
+                }
+                await env.DB.prepare(`
+                    UPDATE routes
+                    SET mode = ?
+                    WHERE prefix IN (SELECT CAST(value AS TEXT) FROM json_each(?))
+                `).bind(mode, JSON.stringify(prefixes)).run();
+                clearRoutesCache();
+                return Response.json({ success: true });
             }
 
             if (request.method === 'DELETE') {
@@ -5628,7 +5935,10 @@ export default {
         function stripPanelCookie(headers) {
             const cookie = headers.get("Cookie");
             if (!cookie) return;
-            const keptCookies = cookie.split(";").map(item => item.trim()).filter(item => item && !item.toLowerCase().startsWith("admin_token="));
+            const keptCookies = cookie.split(";").map(item => item.trim()).filter(item => {
+                const lower = item.toLowerCase();
+                return item && !lower.startsWith("admin_token=") && !lower.startsWith("__host-admin_token=");
+            });
             if (keptCookies.length > 0) headers.set("Cookie", keptCookies.join("; "));
             else headers.delete("Cookie");
         }
@@ -5728,40 +6038,35 @@ export default {
                 || lower.includes('/emby/items/');
         }
         
-        function rewriteSourceUrlsInJson(value, targetOrigins, proxyOrigin, safePrefix, depth = 0) {
+        function rewriteSourceUrlsInJson(value, targetOrigins, proxyOrigin, safePrefix, depth = 0, state = { changed: false }) {
             if (typeof value === 'string') {
-                return shouldRewriteJsonString(value, targetOrigins)
+                const rewritten = shouldRewriteJsonString(value, targetOrigins)
                     ? rewriteSourceUrlString(value, targetOrigins, proxyOrigin, safePrefix)
                     : value;
+                if (rewritten !== value) state.changed = true;
+                return rewritten;
             }
             if (depth >= MAX_JSON_REWRITE_DEPTH) return value;
             if (Array.isArray(value)) {
-                let changed = false;
-                const next = value.map(item => {
-                    const rewritten = rewriteSourceUrlsInJson(item, targetOrigins, proxyOrigin, safePrefix, depth + 1);
-                    if (rewritten !== item) changed = true;
-                    return rewritten;
-                });
-                return changed ? next : value;
+                for (let index = 0; index < value.length; index++) {
+                    value[index] = rewriteSourceUrlsInJson(value[index], targetOrigins, proxyOrigin, safePrefix, depth + 1, state);
+                }
+                return value;
             }
             if (value && typeof value === 'object') {
-                let changed = false;
-                const next = {};
                 for (const key of Object.keys(value)) {
                     // 服务器地址字段也重写（支持 Forward 等客户端的自动更新功能）
                     if (isServerAddressField(key) && typeof value[key] === 'string') {
                         const rewritten = shouldRewriteJsonString(value[key], targetOrigins)
                             ? rewriteSourceUrlString(value[key], targetOrigins, proxyOrigin, safePrefix)
                             : value[key];
-                        if (rewritten !== value[key]) changed = true;
-                        next[key] = rewritten;
+                        if (rewritten !== value[key]) state.changed = true;
+                        value[key] = rewritten;
                         continue;
                     }
-                    const rewritten = rewriteSourceUrlsInJson(value[key], targetOrigins, proxyOrigin, safePrefix, depth + 1);
-                    if (rewritten !== value[key]) changed = true;
-                    next[key] = rewritten;
+                    value[key] = rewriteSourceUrlsInJson(value[key], targetOrigins, proxyOrigin, safePrefix, depth + 1, state);
                 }
-                return changed ? next : value;
+                return value;
             }
             return value;
         }
@@ -5862,33 +6167,62 @@ export default {
             return remainingPath;
         }
 
-        function buildUpstreamCandidates(targetBase, remainingPath, search) {
+        function extractEmbeddedHttpUrl(path) {
+            if (!path || !path.includes('://')) return null;
+            const value = path.startsWith('/') ? path.substring(1) : path;
+            const directMatch = value.match(/^https?:\/\/.+/i);
+            const damagedMatch = value.match(/^[a-z][a-z0-9+.-]*(https?:\/\/.+)$/i);
+            const candidate = directMatch ? directMatch[0] : damagedMatch?.[1];
+            if (!candidate) return null;
+            try {
+                const parsed = new URL(candidate);
+                if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) return null;
+                return parsed;
+            } catch (e) {
+                return null;
+            }
+        }
+
+        function extractSignedEmbeddedHttpUrl(path) {
+            const marker = `/${SIGNED_PROXY_PATH_SEGMENT}/`;
+            if (!path || !path.startsWith(marker)) return null;
+            const signedValue = path.substring(marker.length);
+            const separatorIndex = signedValue.indexOf('/');
+            if (separatorIndex <= 0) return null;
+            const signature = signedValue.substring(0, separatorIndex);
+            const targetValue = signedValue.substring(separatorIndex + 1);
+            try {
+                const target = new URL(targetValue);
+                if (!['http:', 'https:'].includes(target.protocol) || target.username || target.password) return null;
+                return { signature, target };
+            } catch (e) {
+                return null;
+            }
+        }
+
+        async function buildSignedEmbeddedProxyUrl(targetValue, workerOrigin, safePrefix, routePrefix) {
+            const target = targetValue instanceof URL ? targetValue : new URL(targetValue);
+            const cacheKey = `${String(routePrefix || '')}\n${target.origin}`;
+            let signature = proxyOriginSignatureCache.get(cacheKey);
+            if (!signature) {
+                signature = await signProxyOrigin(PROXY_SIGNING_SECRET, routePrefix, target.origin);
+                proxyOriginSignatureCache.set(cacheKey, signature);
+            }
+            return `${workerOrigin}${safePrefix}/${SIGNED_PROXY_PATH_SEGMENT}/${signature}/${target.href}`;
+        }
+
+        function buildUpstreamCandidates(targetBase, remainingPath, search, allowedAbsoluteOrigins = [], allowExternalAbsoluteTargets = false) {
             const candidates = [];
             const pushUnique = (value) => {
                 if (value && !candidates.includes(value)) candidates.push(value);
             };
 
-            // 🚨 紧急修复：检测并修复损坏的 URL 路径
-            // 当 remainingPath 形如 /embyhttps://... 或 /embyhttp://... 时，
-            // 说明之前的 URL 拼接出了问题，client/server 的 bug 导致 protocol 被拼接到了 path 中
-            // 正确做法是从中提取真正的 URL 并返回
-            if (remainingPath && remainingPath.includes('://')) {
-                const afterSlash = remainingPath.substring(1); // 去掉开头的 /
-                // 检查是否包含类似 "embyhttps://" 或 "embyhttp://" 的损坏模式
-                const damagedMatch = afterSlash.match(/^([a-z]+)(https?:\/\/)(.+)/i);
-                if (damagedMatch) {
-                    const protocol = damagedMatch[2]; // https:// 或 http://
-                    const restUrl = damagedMatch[3]; // 域名+路径
-                    const fixedUrl = protocol + restUrl;
-                    try {
-                        const parsed = new URL(fixedUrl);
-                        pushUnique(fixedUrl);
-                        // 也尝试不带域名中可能错误拼接的 emby 前缀
-                        const cleanUrl = parsed.origin + parsed.pathname + parsed.search + parsed.hash;
-                        if (cleanUrl !== fixedUrl) pushUnique(cleanUrl);
-                    } catch (e) { /* 解析失败 */ }
-                    return candidates;
+            const embeddedTarget = extractEmbeddedHttpUrl(remainingPath);
+            if (embeddedTarget) {
+                if (allowExternalAbsoluteTargets || allowedAbsoluteOrigins.includes(embeddedTarget.origin)) {
+                    pushUnique(embeddedTarget.href);
                 }
+                return candidates;
             }
 
             const primary = targetBase + remainingPath + search;
@@ -5972,7 +6306,7 @@ export default {
             return `${safePrefix}${normalizedPath}${search || ''}${hash || ''}`;
         }
 
-        function rewritePlaybackMediaUrl(rawValue, targetUrl, proxyOrigin, safePrefix, targetOrigins) {
+        async function rewritePlaybackMediaUrl(rawValue, targetUrl, proxyOrigin, safePrefix, targetOrigins, routePrefix) {
             if (typeof rawValue !== 'string') return rawValue;
             const trimmedValue = rawValue.trim();
             if (!trimmedValue) return rawValue;
@@ -5991,7 +6325,7 @@ export default {
                 try {
                     const parsed = new URL(targetUrl.protocol + trimmedValue);
                     if (Array.isArray(targetOrigins) && !targetOrigins.includes(parsed.origin)) {
-                        return `${proxyOrigin}${safePrefix}/${parsed.href}`;
+                        return buildSignedEmbeddedProxyUrl(parsed, proxyOrigin, safePrefix, routePrefix);
                     }
                     return toWorkerPlaybackPath(parsed.pathname, parsed.search, parsed.hash, safePrefix);
                 } catch (e) {
@@ -6011,11 +6345,11 @@ export default {
                     const parsed = new URL(trimmedValue);
                     // 对于媒体文件路径（/videos/... 或 /Audio/...），始终返回完整的代理 URL 格式
                     if (parsed.pathname.match(/^\/(videos|Audio)\//)) {
-                        return `${proxyOrigin}${safePrefix}/${trimmedValue}`;
+                        return buildSignedEmbeddedProxyUrl(parsed, proxyOrigin, safePrefix, routePrefix);
                     }
                     // 其他跨源地址返回完整代理 URL
                     if (Array.isArray(targetOrigins) && !targetOrigins.includes(parsed.origin)) {
-                        return `${proxyOrigin}${safePrefix}/${trimmedValue}`;
+                        return buildSignedEmbeddedProxyUrl(parsed, proxyOrigin, safePrefix, routePrefix);
                     }
                     // 同源非媒体地址保持原有逻辑
                     return toWorkerPlaybackPath(parsed.pathname, parsed.search, parsed.hash, safePrefix);
@@ -6033,7 +6367,7 @@ export default {
                 // 检查路径是否是媒体文件路径（/videos/... 或 /Audio/...）
                 if (trimmedValue.match(/^\/(videos|Audio)\//)) {
                     // UHD：前后端分离，必须返回完整的代理 URL，不返回相对路径
-                    return `${proxyOrigin}${safePrefix}/${targetUrl.origin}${trimmedValue}`;
+                    return buildSignedEmbeddedProxyUrl(new URL(trimmedValue, targetUrl.origin), proxyOrigin, safePrefix, routePrefix);
                 }
                 // OK 或其他：前后端不分离，返回相对路径
                 return toWorkerPlaybackPath(trimmedValue, '', '', safePrefix);
@@ -6047,7 +6381,7 @@ export default {
                 try {
                     const parsed = new URL(fixed);
                     if (Array.isArray(targetOrigins) && !targetOrigins.includes(parsed.origin)) {
-                        return `${proxyOrigin}${safePrefix}/${parsed.href}`;
+                        return buildSignedEmbeddedProxyUrl(parsed, proxyOrigin, safePrefix, routePrefix);
                     }
                     return toWorkerPlaybackPath(parsed.pathname, parsed.search, parsed.hash, safePrefix);
                 } catch (e) {
@@ -6065,7 +6399,7 @@ export default {
             }
         }
 
-        function rewriteRedirectLocation(location, targetUrl, targetOrigins, proxyOrigin, safePrefix) {
+        async function rewriteRedirectLocation(location, targetUrl, targetOrigins, proxyOrigin, safePrefix, routePrefix) {
             if (!location) return location;
             if (location.startsWith('//')) {
                 try {
@@ -6085,8 +6419,35 @@ export default {
                     return proxyOrigin + safePrefix + parsed.pathname + parsed.search + parsed.hash;
                 }
             } catch (e) {}
-            if (/^https?:\/\//i.test(location)) return `${proxyOrigin}${safePrefix}/${encodeURIComponent(location)}`;
+            if (/^https?:\/\//i.test(location)) {
+                try {
+                    return buildSignedEmbeddedProxyUrl(new URL(location), proxyOrigin, safePrefix, routePrefix);
+                } catch (e) {
+                    return location;
+                }
+            }
             return location;
+        }
+
+        async function rewriteM3u8AbsoluteUrls(text, workerOrigin, safePrefix, routePrefix) {
+            const pattern = /https?:\/\/[^\s"'<>]+/gi;
+            let result = '';
+            let cursor = 0;
+            for (const match of text.matchAll(pattern)) {
+                const rawUrl = match[0];
+                result += text.substring(cursor, match.index);
+                if (rawUrl.startsWith(workerOrigin + safePrefix + '/')) {
+                    result += rawUrl;
+                } else {
+                    try {
+                        result += await buildSignedEmbeddedProxyUrl(new URL(rawUrl), workerOrigin, safePrefix, routePrefix);
+                    } catch (e) {
+                        result += rawUrl;
+                    }
+                }
+                cursor = match.index + rawUrl.length;
+            }
+            return cursor === 0 ? text : result + text.substring(cursor);
         }
 
         // ==========================================
@@ -6318,6 +6679,8 @@ export default {
 
         const isLegacyGeneralProxyPath = decodedPath.startsWith('/http://') || decodedPath.startsWith('/https://');
         const isEncodedGeneralProxyPath = ENABLE_ENCODED_PROXY_FORMAT && /^\/https?\/[^\/]+\/\d+(?:\/|$)/i.test(decodedPath);
+        let allowedAbsoluteTargetOrigins = [];
+        let allowExternalAbsoluteTargets = false;
 
         if (isLegacyGeneralProxyPath || isEncodedGeneralProxyPath) {
             // 🚫 通用反代访问控制检查
@@ -6340,6 +6703,7 @@ export default {
                     }
                 );
             }
+            allowExternalAbsoluteTargets = true;
 
             // 🆕 支持编码格式通用反代: /{scheme}/{domain}/{port}/{path}
             if (ENABLE_ENCODED_PROXY_FORMAT) {
@@ -6389,26 +6753,51 @@ export default {
                 matchedPrefix = prefix; remainingPath = '/' + pathParts.slice(2).join('/');
                 remainingPath = normalizeRemainingPathForPlayback(remainingPath, matchedPrefix);
                 targetUrls = route.target.split(',').map(s => s.trim()).filter(Boolean);
+                allowedAbsoluteTargetOrigins = getTargetOrigins(targetUrls);
 
-                // 🚨 紧急修复：当 remainingPath 包含损坏的 URL 模式（如 /embyhttps://）时
-                // 直接将其转换为正确的 targetUrl，绕过后续的 buildUpstreamCandidates
-                if (remainingPath.includes('://')) {
-                    const pathWithoutSlash = remainingPath.substring(1);
-                    const damagedMatch = pathWithoutSlash.match(/^([a-z]+)(https?:\/\/)(.+)/i);
-                    if (damagedMatch) {
-                        const protocol = damagedMatch[2];
-                        const restUrl = damagedMatch[3];
-                        const fixedUrl = protocol + restUrl;
-                        try {
-                            new URL(fixedUrl);
-                            targetUrls = [fixedUrl];
-                            remainingPath = '';
-                            // 不 return，让代码继续正常流程
-                        } catch (e) {}
+                // Worker 重写出的跨域播放地址携带 HMAC 签名，不依赖通用代理开关；未签名地址
+                // 仍只允许已配置源站，或由管理员明确开启通用代理后访问。
+                // 部分客户端会把完整 Worker URL 再次拼到 serverUrl 后，形成
+                // /{prefix}/embyhttps://worker/{prefix}/__signed_proxy__/...；先剥掉这层本机 URL，
+                // 再按原签名路径验证，兼容前后端不分离服务器的播放地址拼接行为。
+                const nestedWorkerTarget = extractEmbeddedHttpUrl(remainingPath);
+                const signedRouteBase = `/${matchedPrefix}/${SIGNED_PROXY_PATH_SEGMENT}/`;
+                if (nestedWorkerTarget?.origin === proxyOrigin && nestedWorkerTarget.pathname.startsWith(signedRouteBase)) {
+                    remainingPath = nestedWorkerTarget.pathname.substring(`/${matchedPrefix}`.length);
+                }
+                const signedEmbeddedTarget = extractSignedEmbeddedHttpUrl(remainingPath);
+                if (signedEmbeddedTarget) {
+                    const signatureValid = await verifyProxyOriginSignature(
+                        PROXY_SIGNING_SECRET,
+                        matchedPrefix,
+                        signedEmbeddedTarget.target.origin,
+                        signedEmbeddedTarget.signature
+                    );
+                    if (!signatureValid) {
+                        return Response.json({ error: '代理地址签名无效或已失效' }, { status: 403 });
+                    }
+                    allowExternalAbsoluteTargets = true;
+                    isPassthroughMode = true;
+                    targetUrls = [signedEmbeddedTarget.target.href];
+                    remainingPath = '';
+                } else {
+                    const embeddedTarget = extractEmbeddedHttpUrl(remainingPath);
+                    if (embeddedTarget) {
+                        const isConfiguredOrigin = allowedAbsoluteTargetOrigins.includes(embeddedTarget.origin);
+                        if (!isConfiguredOrigin) {
+                            allowExternalAbsoluteTargets = await getGeneralProxyEnabledCached(env);
+                            if (!allowExternalAbsoluteTargets) {
+                                return Response.json({
+                                    error: '跨源反代已禁用',
+                                    message: '该绝对地址不属于当前节点已配置的源站，且通用反代功能未开启'
+                                }, { status: 403 });
+                            }
+                        }
+                        isPassthroughMode = /^\/https?:\/\//i.test(remainingPath);
+                        targetUrls = [embeddedTarget.href];
+                        remainingPath = '';
                     }
                 }
-
-                if (remainingPath.startsWith('/http://') || remainingPath.startsWith('/https://')) { targetUrls = [remainingPath.substring(1)]; remainingPath = ''; isPassthroughMode = true; }
             } catch (e) { return new Response("DB Error: " + e.message, { status: 500 }); }
         }
 
@@ -6419,28 +6808,6 @@ export default {
         // ==========================================
         const isNewPlaySession = /\/PlaybackInfo/i.test(url.pathname); 
 
-        // 核心修改：仅在点火请求时才记录 "今日播放" 和 "最后活跃"
-        if (isNewPlaySession && matchedPrefix && env.DB && ctx && ctx.waitUntil) {
-            try {
-                const clientIp = request.headers.get("cf-connecting-ip") || request.headers.get("x-real-ip") || "Unknown";
-                const clientUa = request.headers.get("User-Agent") || "Unknown";
-                if (shouldRecordPlaySession(matchedPrefix, clientIp, clientUa)) {
-                    const todayStr = new Date(Date.now() + 8 * 3600000).toISOString().split('T')[0];
-                    const nowTime = new Date(Date.now() + 8 * 3600000).toISOString().replace('T', ' ').split('.')[0]; 
-                    
-                    let stmts = [
-                        env.DB.prepare(`INSERT INTO request_stats (prefix, date, count) VALUES (?, ?, 1) ON CONFLICT(prefix, date) DO UPDATE SET count = count + 1`).bind(matchedPrefix, todayStr),
-                        env.DB.prepare(`UPDATE routes SET last_play = ? WHERE prefix = ?`).bind(nowTime, matchedPrefix)
-                    ];
-
-                    const clientCountry = request.headers.get("cf-ipcountry") || "Unknown";
-                    const clientCity = request.cf?.city || "";
-                    stmts.push(env.DB.prepare(`INSERT INTO visitor_logs (prefix, ip, country, city, ua) VALUES (?, ?, ?, ?, ?)`).bind(matchedPrefix, clientIp, clientCountry, clientCity, clientUa));
-
-                    ctx.waitUntil(env.DB.batch(stmts));
-                }
-            } catch(e) {}
-        }
 
         // ==========================================
         // 2.8 无伪装模式下的源站反代 (含强力防 403 引擎)
@@ -6454,7 +6821,7 @@ export default {
         const canHaveRequestBody = request.method !== 'GET' && request.method !== 'HEAD';
         const needsReplayableBody = canHaveRequestBody && (
             targetUrls.length > 1
-            || targetUrls.some(target => buildUpstreamCandidates(target, remainingPath, url.search).length > 1)
+            || targetUrls.some(target => buildUpstreamCandidates(target, remainingPath, url.search, allowedAbsoluteTargetOrigins, allowExternalAbsoluteTargets).length > 1)
         );
 
         if (needsReplayableBody) {
@@ -6462,7 +6829,7 @@ export default {
             // 1. 多节点 failover：同一个 POST 可能发往多个 target
             // 2. 同节点候选回退：例如 /Items/... 失败后，再试 /emby/Items/...
             try {
-                bodyBuffer = await readRequestArrayBufferWithinLimit(request.clone(), MAX_REPLAY_BODY_BYTES);
+                bodyBuffer = await readRequestArrayBufferWithinLimit(request, MAX_REPLAY_BODY_BYTES);
             } catch(e) {
                 return new Response(e.message, { status: 413 });
             }
@@ -6471,11 +6838,20 @@ export default {
         let finalResponse = null; let lastError = null; let finalTargetUrl = null;
 
         for (let i = 0; i < targetUrls.length; i++) {
-            const candidateUrls = buildUpstreamCandidates(targetUrls[i], remainingPath, url.search);
+            const candidateUrls = buildUpstreamCandidates(targetUrls[i], remainingPath, url.search, allowedAbsoluteTargetOrigins, allowExternalAbsoluteTargets);
 
             for (let j = 0; j < candidateUrls.length; j++) {
                 const targetUrlStr = candidateUrls[j];
-                const targetUrl = new URL(targetUrlStr);
+                let targetUrl;
+                try {
+                    targetUrl = new URL(targetUrlStr);
+                    if (targetUrl.protocol !== 'http:' && targetUrl.protocol !== 'https:') {
+                        throw new Error('unsupported protocol');
+                    }
+                } catch (error) {
+                    lastError = new Error(`Node ${i + 1} candidate ${j + 1} has an invalid upstream URL`);
+                    continue;
+                }
                 const newHeaders = new Headers(request.headers); newHeaders.set("Host", targetUrl.host);
                 stripPanelCookie(newHeaders);
 
@@ -6500,8 +6876,21 @@ export default {
 
                 const isStaticOrImage = isStaticPath(targetUrl.pathname);
                 const authLikeState = hasAuthLikeState(newHeaders, targetUrl);
+                const isDynamicMediaApi = !request.headers.has('Range')
+                    && !isStaticOrImage
+                    && !looksLikeMediaPath(targetUrl.pathname)
+                    && isLikelyMediaServerPath(targetUrl.pathname);
+
+                if (isDynamicMediaApi) {
+                    newHeaders.set('Cache-Control', 'no-cache');
+                    newHeaders.set('Pragma', 'no-cache');
+                }
 
                 let fetchInit = { method: request.method, headers: newHeaders, redirect: isStaticOrImage ? 'follow' : 'manual' };
+
+                // Items/PlaybackInfo 等动态 API 的查询参数会直接改变响应内容。显式绕过上游
+                // Cloudflare/反代缓存，避免忽略查询参数的缓存规则让不同排序请求拿到同一份 JSON。
+                if (isDynamicMediaApi) fetchInit.cache = 'no-store';
 
                 // 只缓存不带鉴权态的静态资源
                 if (isStaticOrImage && enableCache && !authLikeState) { fetchInit.cf = { cacheEverything: true, cacheTtl: 86400 }; }
@@ -6525,10 +6914,15 @@ export default {
                         console.log(`[${category}] ${response.status} ${request.method} ${targetUrl.host}${targetUrl.pathname}${targetUrl.search}`);
                     }
 
-                    // 404/502/503/504 时，尝试同一 target 的下一候选（/emby 回退）
-                    if ((response.status === 404 || response.status === 502 || response.status === 503 || response.status === 504) && j < candidateUrls.length - 1) {
+                    // 404/5xx 时，优先尝试同一 target 的下一候选，再切换到下一个节点
+                    const isRetryableResponse = response.status === 404 || response.status >= 500;
+                    const hasNextCandidate = j < candidateUrls.length - 1;
+                    const hasNextTarget = i < targetUrls.length - 1;
+                    if (isRetryableResponse && (hasNextCandidate || hasNextTarget)) {
                         lastError = new Error(`Node ${i+1} candidate ${j+1} returned HTTP ${response.status}`);
-                        continue;
+                        cancelReadableQuietly(response.body);
+                        if (hasNextCandidate) continue;
+                        break;
                     }
                     finalResponse = response; finalTargetUrl = targetUrl; break;
                 } catch (err) { lastError = err; continue; }
@@ -6537,6 +6931,37 @@ export default {
         }
 
         if (!finalResponse) return new Response("Worker Proxy Failover Exhausted. All nodes failed. Last Error: " + (lastError?.message || 'Unknown Error'), { status: 502 });
+
+        // 只有上游成功返回 PlaybackInfo 后，才记录播放和最后活跃时间。
+        if (isNewPlaySession && finalResponse.ok && matchedPrefix && env.DB && ctx && ctx.waitUntil) {
+            try {
+                const clientIp = request.headers.get("cf-connecting-ip") || request.headers.get("x-real-ip") || "Unknown";
+                const clientUa = request.headers.get("User-Agent") || "Unknown";
+                const playSessionDedupeKey = buildPlaySessionDedupeKey(matchedPrefix, clientIp, clientUa);
+                if (shouldRecordPlaySession(matchedPrefix, clientIp, clientUa)) {
+                    const todayStr = new Date(Date.now() + 8 * 3600000).toISOString().split('T')[0];
+                    const nowTime = new Date(Date.now() + 8 * 3600000).toISOString().replace('T', ' ').split('.')[0];
+                    const stmts = [
+                        env.DB.prepare(`INSERT INTO request_stats (prefix, date, count) VALUES (?, ?, 1) ON CONFLICT(prefix, date) DO UPDATE SET count = count + 1`).bind(matchedPrefix, todayStr),
+                        env.DB.prepare(`UPDATE routes SET last_play = ? WHERE prefix = ?`).bind(nowTime, matchedPrefix),
+                        env.DB.prepare(`INSERT INTO visitor_logs (prefix, ip, country, city, ua) VALUES (?, ?, ?, ?, ?)`).bind(
+                            matchedPrefix,
+                            clientIp,
+                            request.headers.get("cf-ipcountry") || "Unknown",
+                            request.cf?.city || "",
+                            clientUa
+                        )
+                    ];
+                    const writePromise = env.DB.batch(stmts).catch(error => {
+                        PLAY_SESSION_DEDUPE_CACHE.delete(playSessionDedupeKey);
+                        console.error(`Playback statistics write failed for ${matchedPrefix}:`, error);
+                    });
+                    ctx.waitUntil(writePromise);
+                }
+            } catch (error) {
+                console.error(`Playback statistics scheduling failed for ${matchedPrefix}:`, error);
+            }
+        }
 
         const responseHeaders = new Headers(finalResponse.headers);
         rewriteSetCookieForProxy(responseHeaders);
@@ -6549,13 +6974,26 @@ export default {
         // ==========================================
         if ([301, 302, 303, 307, 308].includes(finalResponse.status)) {
             const location = responseHeaders.get('Location');
-            const rewrittenLocation = rewriteRedirectLocation(location, finalTargetUrl, targetOrigins, proxyOrigin, safePrefix);
+            const rewrittenLocation = await rewriteRedirectLocation(location, finalTargetUrl, targetOrigins, proxyOrigin, safePrefix, matchedPrefix);
             if (rewrittenLocation !== location) {
                 responseHeaders.set('Location', rewrittenLocation);
             }
         }
 
         responseHeaders.set('Access-Control-Allow-Origin', '*');
+
+        // Cloudflare 的 WebSocket 握手响应必须保留 webSocket 句柄；普通 Response
+        // 不能构造 101 状态，也不能承载后续双向数据通道。
+        if (finalResponse.webSocket) {
+            responseHeaders.set('Cache-Control', 'no-store');
+            responseHeaders.delete('Content-Length');
+            responseHeaders.delete('Content-Encoding');
+            return new Response(null, {
+                status: 101,
+                headers: responseHeaders,
+                webSocket: finalResponse.webSocket
+            });
+        }
 
         // ==========================================
         // 2.10 响应体重写 (接管 PlaybackInfo 与 M3U8)
@@ -6575,33 +7013,34 @@ export default {
                 let data = JSON.parse(await readResponseTextWithinLimit(clonedRes, MAX_REWRITE_BODY_BYTES));
                 let modified = false;
                 if (data && data.MediaSources) {
-                    data.MediaSources.forEach(source => {
+                    for (const source of data.MediaSources) {
                         // 播放地址：使用完整的 rewritePlaybackMediaUrl 处理所有格式
-                        ['DirectStreamUrl', 'TranscodingUrl', 'Url'].forEach(key => {
+                        for (const key of ['DirectStreamUrl', 'TranscodingUrl', 'Url']) {
                             if (source[key]) {
-                                const rewritten = rewritePlaybackMediaUrl(source[key], finalTargetUrl, proxyOrigin, safePrefix, targetOrigins);
+                                const rewritten = await rewritePlaybackMediaUrl(source[key], finalTargetUrl, proxyOrigin, safePrefix, targetOrigins, matchedPrefix);
                                 if (rewritten !== source[key]) {
                                     source[key] = rewritten;
                                     modified = true;
                                 }
                             }
-                        });
+                        }
                         // 字幕流的 DeliveryUrl 也会在播放时被客户端直接请求
                         if (source.MediaStreams) {
-                            source.MediaStreams.forEach(stream => {
+                            for (const stream of source.MediaStreams) {
                                 if (stream?.DeliveryUrl) {
-                                    const rewritten = rewritePlaybackMediaUrl(stream.DeliveryUrl, finalTargetUrl, proxyOrigin, safePrefix, targetOrigins);
+                                    const rewritten = await rewritePlaybackMediaUrl(stream.DeliveryUrl, finalTargetUrl, proxyOrigin, safePrefix, targetOrigins, matchedPrefix);
                                     if (rewritten !== stream.DeliveryUrl) {
                                         stream.DeliveryUrl = rewritten;
                                         modified = true;
                                     }
                                 }
-                            });
+                            }
                         }
-                    });
+                    }
                 }
                 if (modified) {
                     dropBodyIntegrityHeaders(responseHeaders);
+                    applyProxyCacheHeaders(responseHeaders, request, url.pathname, enableCache);
                     return new Response(JSON.stringify(data), { status: finalResponse.status, statusText: finalResponse.statusText, headers: responseHeaders });
                 }
             } catch (e) {
@@ -6621,10 +7060,12 @@ export default {
                 let text = await readResponseTextWithinLimit(clonedRes, MAX_REWRITE_BODY_BYTES);
                 if (hasJsonRewriteCandidate(text, targetOrigins)) {
                     let data = JSON.parse(text);
-                    let rewritten = rewriteSourceUrlsInJson(data, targetOrigins, proxyOrigin, safePrefix);
-                    if (rewritten !== data) {
+                    const rewriteState = { changed: false };
+                    rewriteSourceUrlsInJson(data, targetOrigins, proxyOrigin, safePrefix, 0, rewriteState);
+                    if (rewriteState.changed) {
                         dropBodyIntegrityHeaders(responseHeaders);
-                        return new Response(JSON.stringify(rewritten), { status: finalResponse.status, statusText: finalResponse.statusText, headers: responseHeaders });
+                        applyProxyCacheHeaders(responseHeaders, request, url.pathname, enableCache);
+                        return new Response(JSON.stringify(data), { status: finalResponse.status, statusText: finalResponse.statusText, headers: responseHeaders });
                     }
                 }
             } catch(e) {
@@ -6633,14 +7074,18 @@ export default {
         }
 
         // 🚀 处理 M3U8 播放列表中的真实视频切片链接
-        if (finalResponse.status === 200 && url.pathname.toLowerCase().endsWith('.m3u8')) {
+        const isM3u8Response = finalResponse.status === 200 && (
+            url.pathname.toLowerCase().endsWith('.m3u8')
+            || /(?:mpegurl|vnd\.apple\.mpegurl)/i.test(responseHeaders.get('content-type') || '')
+        );
+        if (isM3u8Response) {
             try {
                 let clonedRes = finalResponse.clone(); 
                 let text = await readResponseTextWithinLimit(clonedRes, MAX_REWRITE_BODY_BYTES);
                 if (text.includes('http://') || text.includes('https://')) {
-                    // 🎯 同样修复变量名
-                    let modifiedText = text.replace(/(https?:\/\/[^\s]+)/g, proxyOrigin + safePrefix + '/$1');
-                    responseHeaders.delete("Content-Length"); 
+                    const modifiedText = await rewriteM3u8AbsoluteUrls(text, proxyOrigin, safePrefix, matchedPrefix);
+                    dropBodyIntegrityHeaders(responseHeaders);
+                    applyProxyCacheHeaders(responseHeaders, request, url.pathname, enableCache);
                     return new Response(modifiedText, { status: finalResponse.status, statusText: finalResponse.statusText, headers: responseHeaders });
                 }
             } catch(e) {

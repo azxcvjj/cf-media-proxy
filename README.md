@@ -24,6 +24,16 @@
 
 ## 更新日志
 
+### v2.1.1.2
+- 修复 WebSocket 握手响应：保留 Cloudflare `webSocket` 句柄，恢复 Emby 实时会话与状态通道
+- 增强前后端分离播放兼容：跨域媒体、M3U8 分片和重定向使用 HMAC 签名代理地址，通用代理关闭时仍可安全播放
+- 修复部分客户端重复拼接服务器地址导致的播放失败，兼容 `embyhttps://Worker/前缀/签名地址` 等嵌套路径
+- 加固管理面板登录：改为服务端校验并签发 `HttpOnly __Host-` Cookie，旧的脚本可读 Cookie 不再用于鉴权
+- 固定 SortableJS、Chart.js 和旗帜样式依赖版本并增加 SRI 校验，同时为管理页面增加 CSP nonce
+- 动态 Items、PlaybackInfo 等 API 子请求显式使用 `no-store`，降低中间缓存复用用户态或查询结果的风险
+- 提升代理与数据库稳定性：完善上游 URL 校验、请求体重放、全节点 5xx 故障转移、Schema 初始化和批量路由操作
+- 完善 GraphQL 流量统计的超时、部分失败与时间范围处理，避免异常批次被误显示为零流量
+
 ### v2.1.1.1
 - 优化 Worker 资源占用：为路由配置、通用反代开关和 Cloudflare GraphQL 流量统计增加短时内存缓存，减少高频 D1/API 读取
 - 增强 JSON 重写安全性：增加递归深度保护和字符串快速预检，降低大 JSON 响应对 CPU 与内存的压力
