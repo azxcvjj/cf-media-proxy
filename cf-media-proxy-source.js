@@ -1,6 +1,6 @@
-// VERSION: 2.1.1.2
+// VERSION: 2.1.1.3
 // 🟢 面板核心配置区 (放在最顶端方便修改)
-const CURRENT_VERSION = "2.1.1.2";
+const CURRENT_VERSION = "2.1.1.3";
 const GITHUB_RAW_URL = "https://raw.githubusercontent.com/azxcvjj/cf-media-proxy/main/cf-media-proxy.js";
 
 // ==========================================
@@ -43,6 +43,7 @@ const ROUTE_CACHE_TTL_MS = 30 * 1000;
 const SETTINGS_CACHE_TTL_MS = 30 * 1000;
 const GRAPHQL_TRAFFIC_CACHE_TTL_MS = 5 * 60 * 1000;
 const PLAY_SESSION_DEDUPE_TTL_MS = 60 * 1000;
+const UPSTREAM_RESPONSE_TIMEOUT_MS = 5 * 1000;
 const DEFAULT_MEMORY_CACHE_MAX_ENTRIES = 256;
 const MAX_PLAY_SESSION_CACHE_ENTRIES = 5000;
 const SIGNED_PROXY_PATH_SEGMENT = '__signed_proxy__';
@@ -6904,8 +6905,18 @@ export default {
                     }
                 }
 
+                let upstreamTimeoutId = null;
                 try {
+                    // 只有存在下一条备用线路时才限制等待响应头的时间。
+                    // 唯一线路或最后一条兜底线路可能需要等待源站转码启动，不能主动中断。
+                    if (i < targetUrls.length - 1) {
+                        const upstreamController = new AbortController();
+                        fetchInit.signal = upstreamController.signal;
+                        upstreamTimeoutId = setTimeout(() => upstreamController.abort(), UPSTREAM_RESPONSE_TIMEOUT_MS);
+                    }
                     const modifiedRequest = new Request(targetUrl, fetchInit); const response = await fetch(modifiedRequest);
+                    clearTimeout(upstreamTimeoutId);
+                    upstreamTimeoutId = null;
 
                     // 🆕 日志分级（可选）
                     if (ENABLE_DETAILED_LOGGING) {
@@ -6914,18 +6925,31 @@ export default {
                         console.log(`[${category}] ${response.status} ${request.method} ${targetUrl.host}${targetUrl.pathname}${targetUrl.search}`);
                     }
 
-                    // 404/5xx 时，优先尝试同一 target 的下一候选，再切换到下一个节点
-                    const isRetryableResponse = response.status === 404 || response.status >= 500;
+                    // 404/5xx 可能只是 /emby 路径形态不匹配，先试同线路候选。
+                    // 403/408/425/429 更可能是当前线路的访问控制、超时或限流，直接切换线路。
+                    const canRetryPathCandidate = response.status === 404 || response.status >= 500;
+                    const canFailoverTarget = canRetryPathCandidate
+                        || response.status === 403
+                        || response.status === 408
+                        || response.status === 425
+                        || response.status === 429;
                     const hasNextCandidate = j < candidateUrls.length - 1;
                     const hasNextTarget = i < targetUrls.length - 1;
-                    if (isRetryableResponse && (hasNextCandidate || hasNextTarget)) {
+                    if (canFailoverTarget && ((canRetryPathCandidate && hasNextCandidate) || hasNextTarget)) {
                         lastError = new Error(`Node ${i+1} candidate ${j+1} returned HTTP ${response.status}`);
                         cancelReadableQuietly(response.body);
-                        if (hasNextCandidate) continue;
+                        if (canRetryPathCandidate && hasNextCandidate) continue;
                         break;
                     }
                     finalResponse = response; finalTargetUrl = targetUrl; break;
-                } catch (err) { lastError = err; continue; }
+                } catch (err) {
+                    lastError = err;
+                    // DNS、TLS、连接超时等 fetch 异常与 URL 路径无关，
+                    // 换 /emby 候选不会恢复，直接结束当前线路并进入下一条。
+                    break;
+                } finally {
+                    if (upstreamTimeoutId !== null) clearTimeout(upstreamTimeoutId);
+                }
             }
             if (finalResponse) break;
         }
