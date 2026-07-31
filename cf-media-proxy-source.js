@@ -1,6 +1,6 @@
-// VERSION: 2.1.1.3
+// VERSION: 2.1.1.4
 // 🟢 面板核心配置区 (放在最顶端方便修改)
-const CURRENT_VERSION = "2.1.1.3";
+const CURRENT_VERSION = "2.1.1.4";
 const GITHUB_RAW_URL = "https://raw.githubusercontent.com/azxcvjj/cf-media-proxy/main/cf-media-proxy.js";
 
 // ==========================================
@@ -56,6 +56,21 @@ const PLAY_SESSION_DEDUPE_CACHE = new Map();
 const PROXY_SIGNING_KEY_CACHE = new Map();
 let memoryCacheWriteCount = 0;
 let databaseSchemaInitPromise = null;
+
+function sanitizeProxyErrorForLog(error) {
+    let rawMessage = 'Unknown Error';
+    try {
+        rawMessage = String(error?.message || error || rawMessage);
+    } catch (sanitizeError) {
+        rawMessage = 'Unprintable error';
+    }
+    return rawMessage
+        .slice(0, 2000)
+        .replace(/[\u0000-\u001F\u007F\u2028\u2029]+/g, ' ')
+        .replace(/(https?:\/\/[^\s?#]+)\?[^\s]*/gi, '$1?[REDACTED]')
+        .replace(/((?:api_key|apikey|access_token|token|x-emby-token|x-emby-authorization)=)[^&\s]*/gi, '$1[REDACTED]')
+        .slice(0, 500);
+}
 
 async function getProxySigningKey(secret) {
     const normalizedSecret = String(secret || '');
@@ -6954,7 +6969,22 @@ export default {
             if (finalResponse) break;
         }
 
-        if (!finalResponse) return new Response("Worker Proxy Failover Exhausted. All nodes failed. Last Error: " + (lastError?.message || 'Unknown Error'), { status: 502 });
+        if (!finalResponse) {
+            const errorDetail = sanitizeProxyErrorForLog(lastError);
+            const rayId = request.headers.get('cf-ray') || 'unknown';
+            console.error(
+                `[FAILOVER] All upstreams failed: prefix=${matchedPrefix || 'general'} `
+                + `method=${request.method} ray=${rayId} error=${errorDetail}`
+            );
+            return new Response(request.method === 'HEAD' ? null : 'Bad Gateway', {
+                status: 502,
+                headers: {
+                    'Content-Type': 'text/plain; charset=UTF-8',
+                    'Cache-Control': 'no-store',
+                    'Access-Control-Allow-Origin': '*'
+                }
+            });
+        }
 
         // 只有上游成功返回 PlaybackInfo 后，才记录播放和最后活跃时间。
         if (isNewPlaySession && finalResponse.ok && matchedPrefix && env.DB && ctx && ctx.waitUntil) {
