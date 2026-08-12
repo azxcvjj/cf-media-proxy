@@ -1,6 +1,6 @@
-// VERSION: 2.1.1.4
+// VERSION: 2.1.1.5
 // 🟢 面板核心配置区 (放在最顶端方便修改)
-const CURRENT_VERSION = "2.1.1.4";
+const CURRENT_VERSION = "2.1.1.5";
 const GITHUB_RAW_URL = "https://raw.githubusercontent.com/azxcvjj/cf-media-proxy/main/cf-media-proxy.js";
 
 // ==========================================
@@ -240,6 +240,14 @@ function parseClientName(ua) {
     if (cleanUA.includes('mpv')) return os ? `MPV ${os}` : 'MPV';
     if (cleanUA.includes('mplayer')) return os ? `MPlayer ${os}` : 'MPlayer';
     if (cleanUA.includes('curl') || cleanUA.includes('wget')) return '命令行工具';
+    // 未收录的新客户端通常以 Product/Version 开头，保留原始大小写自动识别。
+    // 排除常见浏览器、系统网络栈和播放引擎，避免把底层组件误报为客户端。
+    const productMatch = ua.trim().match(/^([A-Za-z][A-Za-z0-9._-]{1,39})\/[0-9][^\s]*/);
+    if (productMatch) {
+        const product = productMatch[1];
+        const genericProducts = ['mozilla', 'dalvik', 'okhttp', 'cfnetwork', 'applecoremedia', 'lavf', 'exoplayerlib'];
+        if (!genericProducts.includes(product.toLowerCase())) return os ? `${product} ${os}` : product;
+    }
     if (os) return os;
     if (cleanUA.length > 0 && cleanUA.length < 80) return cleanUA.substring(0, 50);
     return '其他';
@@ -4943,7 +4951,7 @@ async function sendTgStats(env, chatId, messageId = null) {
                 AND ua != 'Unknown'
                 AND ua IS NOT NULL
                 GROUP BY ua
-                ORDER BY c DESC LIMIT 5
+                ORDER BY c DESC
             `).all(),
             probeWorkerColoStatus(),
             env.DB.prepare(`SELECT prefix, remark FROM routes ORDER BY sort_order ASC, prefix ASC`).all()
